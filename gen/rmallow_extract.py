@@ -52,6 +52,10 @@ import tempfile
 GEN = "src/nvidia/generated"
 INC = "src/common/sdk/nvidia/inc"
 RMAPI = "src/nvidia/src/kernel/rmapi"
+RS_SERVER = "src/nvidia/src/libraries/resserv/src/rs_server.c"
+DEPREC = "src/nvidia/interface/deprecated"
+ENTRY_POINTS = "src/nvidia/src/kernel/rmapi/entry_points.c"
+PARAM_COPY = "src/nvidia/inc/kernel/rmapi/param_copy.h"
 
 # The four control flags the rule turns on, by name. Their *values* are read
 # out of each release's own header: 535.129.03 numbers them differently from
@@ -203,11 +207,250 @@ def define_index(ogkm):
     return idx
 
 
+def resolve_type(name, types, defs, aliases):
+    """The header declaring a type, chasing `#define OLD NEW` aliases.
+
+    54 parameter structs in 615.71.09 are spelled as an alias of another --
+    `NV0080_CTRL_BSP_GET_CAPS_PARAMS` is a macro for the NVDEC one, not a
+    typedef -- so a name missing from the type index is not a name missing
+    from the headers.
+    """
+    hdrs, seen = [], set()
+    while name and name not in seen:
+        seen.add(name)
+        if name in types:
+            hdrs.append(types[name])
+            return hdrs
+        if name in defs:
+            hdrs.append(defs[name])
+            name = aliases.get(name)
+            continue
+        return None
+    return None
+
+
+def alias_index(ogkm):
+    """One-line `#define NAME OTHER` aliases, NAME -> OTHER."""
+    out = {}
+    root = os.path.join(ogkm, INC)
+    pat = re.compile(r"^\s*#\s*define\s+(\w+)\s+(\w+)\s*$")
+    for dirpath, _, names in os.walk(root):
+        for n in names:
+            if not n.endswith(".h"):
+                continue
+            for ln in open(os.path.join(dirpath, n), errors="replace"):
+                m = pat.match(ln)
+                if m:
+                    out.setdefault(m.group(1), m.group(2))
+    return out
+
+
 RS_ENTRY_RE = re.compile(
-    r"RS_ENTRY\(\s*/\*\s*External Class\s*\*/\s*(\w+)\s*,.*?"
-    r"/\*\s*Alloc Param Info\s*\*/\s*(RS_NONE|RS_OPTIONAL\((\w+)\)|RS_REQUIRED\((\w+)\))\s*,",
+    r"RS_ENTRY\(\s*/\*\s*External Class\s*\*/\s*(?P<name>\w+)\s*,\s*"
+    r"/\*\s*Internal Class\s*\*/\s*(?P<internal>\w+)\s*,.*?"
+    r"/\*\s*Alloc Param Info\s*\*/\s*"
+    r"(?:RS_NONE|RS_OPTIONAL\((?P<opt>\w+)\)|RS_REQUIRED\((?P<req>\w+)\))\s*,",
     re.S,
 )
+
+
+# `NvBool bClientAlloc = (pParams->externalClassId == NV01_ROOT || ...)` in
+# serverAllocResource. The classes it names are allocated by serverAllocClient,
+# which never reaches _serverAllocValidatePrivilege, so they carry no privilege
+# flag in RS_ENTRY and the rule below must not ask them for one.
+CLIENT_ALLOC = re.compile(
+    r"bClientAlloc\s*=\s*\((?P<body>[^;]*?)\)\s*;", re.S
+)
+
+
+def client_classes(ogkm):
+    """The classes RM allocates as clients rather than as resources.
+
+    Read out of rs_server.c rather than listed here. Every process that opens
+    the device allocates one of these first, so getting this wrong refuses
+    everything -- which is exactly what it did the first time, when the rule
+    asked a client object for a privilege flag that RM never gives it.
+    """
+    text = open(os.path.join(ogkm, RS_SERVER), errors="replace").read()
+    m = CLIENT_ALLOC.search(text)
+    if not m:
+        sys.exit(f"no bClientAlloc in {RS_SERVER}; this release decides client allocation differently")
+    names = set(re.findall(r"externalClassId\s*==\s*(\w+)", m.group("body")))
+    if not names:
+        sys.exit(f"bClientAlloc in {RS_SERVER} names no classes")
+    return names
+
+
+# Three more ways into RM, none of which carries a control flag.
+#
+# `_nv04ControlWithSecInfo` in entry_points.c asks RmDeprecatedGetControlHandler
+# first and only falls through to the ordinary resource-server dispatch if it
+# comes back NULL. So before the NVOC tables are consulted at all:
+#
+#   1. rmDeprecatedControlTable -- eight commands, each rewritten by a
+#      V2 converter into a modern command and reissued with the caller's own
+#      security info. The modern command's flags are the privilege rule; the
+#      legacy command is a spelling of it with an older parameter struct.
+#   2. IsGssLegacyCall(cmd), i.e. cmd & RM_GSS_LEGACY_MASK -- forwarded whole
+#      to GSP firmware, which RM no longer tries to understand. RM's privilege
+#      rule for these is in the command number: bit 0x4000 means root.
+#
+# And once dispatch does reach the resource server, a class whose Control is a
+# catch-all forwarder (BinaryApi) serves any command sent to it without an
+# exported-method entry. There the privilege is the *class's*, which is why RM
+# has two of them -- NV2081_BINAPI non-privileged, NV2082_BINAPI_PRIVILEGED not.
+
+DEPREC_ROW = re.compile(
+    r"\{\s*(?P<cmd>NV\w*_CTRL_CMD_\w+)\s*,\s*V2_CONVERTER\(\s*(?P<conv>_\w+)\s*\)\s*"
+    r"(?:,\s*(?P<skip_vgpu>\w+)\s*)?\}"
+)
+DEPREC_BODY = re.compile(
+    r"static\s+NV_STATUS\s+V2_CONVERTER\(\s*(?P<conv>_\w+)\s*\)\s*\n\(" r"(?P<body>.*?)\n\}",
+    re.S,
+)
+# A params struct this release names for the older form of the call: a
+# `*_PARAMS` type that is not the V2 one the converter builds.
+DEPREC_OLD_PARAMS = re.compile(r"\b(NV\w*_CTRL_\w*_PARAMS)\b")
+DEPREC_NEW_CMD = re.compile(r"\b(NV\w*_CTRL_CMD_\w+_V2)\b")
+
+
+def deprecated_controls(ogkm):
+    """The legacy commands RM rewrites, each with the command it rewrites to.
+
+    A converter reissues the call with the caller's own security info, so the
+    modern command's flags decide whether the legacy spelling is allowed. The
+    size, though, is the *old* struct's: that is what the guest sends.
+    """
+    path = os.path.join(ogkm, DEPREC, "rmapi_deprecated_control.c")
+    text = open(path, errors="replace").read()
+    if "rmDeprecatedControlTable" not in text:
+        sys.exit(f"no rmDeprecatedControlTable in {path}; this release routes legacy controls differently")
+    bodies = {m.group("conv"): m.group("body") for m in DEPREC_BODY.finditer(text)}
+    out = {}
+    for m in DEPREC_ROW.finditer(text):
+        conv, cmd = m.group("conv"), m.group("cmd")
+        skip = m.group("skip_vgpu")
+        if skip is not None and skip != "NV_FALSE":
+            sys.exit(
+                f"{path}: {cmd} is converted conditionally (bSkipVGPU {skip}); "
+                "which rule applies depends on the GPU and this table cannot say"
+            )
+        body = bodies.get(conv)
+        if body is None:
+            sys.exit(f"{path}: no body for the converter {conv} that handles {cmd}")
+        target = DEPREC_NEW_CMD.search(body)
+        if not target:
+            sys.exit(f"{path}: the converter for {cmd} names no V2 command; read it before trusting this table")
+        old = [t for t in DEPREC_OLD_PARAMS.findall(body) if "_V2" not in t]
+        if not old:
+            sys.exit(f"{path}: the converter for {cmd} names no legacy parameter struct")
+        out[cmd] = (target.group(1), old[0])
+    if not out:
+        sys.exit(f"{path}: rmDeprecatedControlTable parsed to nothing")
+    return out
+
+
+def gss_rule(ogkm):
+    """RM's privilege rule for the commands it forwards to GSP firmware.
+
+    These carry no flags anywhere: RM stopped implementing them and passes them
+    through. The rule is in the command number, and RmGssLegacyRpcCmd is the
+    only place that says so, so the shape of its check is asserted here rather
+    than remembered.
+    """
+    hdr = open(os.path.join(ogkm, DEPREC, "rmapi_deprecated.h"), errors="replace").read()
+    masks = {}
+    for name in ("RM_GSS_LEGACY_MASK", "RM_GSS_LEGACY_MASK_PRIVILEGED"):
+        m = re.search(rf"#define\s+{name}\s+(0x[0-9a-fA-F]+)", hdr)
+        if not m:
+            sys.exit(f"{name} is not in rmapi_deprecated.h; this release marks GSS-legacy commands differently")
+        masks[name] = int(m.group(1), 16)
+    if not masks["RM_GSS_LEGACY_MASK"]:
+        sys.exit("RM_GSS_LEGACY_MASK is 0; every command would look GSS-legacy")
+    if masks["RM_GSS_LEGACY_MASK_PRIVILEGED"] & masks["RM_GSS_LEGACY_MASK"] != masks["RM_GSS_LEGACY_MASK"]:
+        sys.exit("RM_GSS_LEGACY_MASK_PRIVILEGED no longer contains RM_GSS_LEGACY_MASK; re-read the rule")
+
+    # `IsGssLegacyCall` is the gate, in the other file.
+    gate = open(os.path.join(ogkm, DEPREC, "rmapi_deprecated_control.c"), errors="replace").read()
+    if not re.search(r"IsGssLegacyCall.*?return\s*!!\(\s*cmd\s*&\s*RM_GSS_LEGACY_MASK\s*\)", gate, re.S):
+        sys.exit("IsGssLegacyCall is no longer a test of RM_GSS_LEGACY_MASK; read it again")
+
+    rpc = open(os.path.join(ogkm, DEPREC, "rmapi_gss_legacy_control.c"), errors="replace").read()
+    if not re.search(
+        r"\(\s*pArgs->cmd\s*&\s*RM_GSS_LEGACY_MASK_PRIVILEGED\s*\)\s*==\s*RM_GSS_LEGACY_MASK_PRIVILEGED\s*\)\s*&&\s*"
+        r"\(\s*pSecInfo->privLevel\s*<\s*RS_PRIV_LEVEL_USER_ROOT\s*\)",
+        rpc,
+    ):
+        sys.exit(
+            "RmGssLegacyRpcCmd no longer refuses the privileged mask to a non-root caller; "
+            "the backend's rule for GSP-forwarded commands is a copy of that check and has to be re-read"
+        )
+
+    # RM does not size these -- it forwards whatever it is given, up to a cap
+    # that is itself different for the privileged half.
+    cap = re.search(r"#define\s+RMAPI_PARAM_COPY_MAX_PARAMS_SIZE\s+\(([^)]*)\)", open(os.path.join(ogkm, PARAM_COPY), errors="replace").read())
+    if not cap:
+        sys.exit("RMAPI_PARAM_COPY_MAX_PARAMS_SIZE is not in param_copy.h; GSP-forwarded commands would be uncapped")
+    max_params = eval(cap.group(1), {"__builtins__": {}}, {})  # e.g. (2*1024*1024)
+    if not isinstance(max_params, int) or max_params <= 0:
+        sys.exit(f"RMAPI_PARAM_COPY_MAX_PARAMS_SIZE did not read as a size: {cap.group(1)!r}")
+    # 535.129.03 applies no ceiling here at all: it allocates whatever size the
+    # caller names and copies into it. The backend applies RM's own constant
+    # anyway, which is stricter than that release and no looser than any other
+    # -- an uncapped size on this path is a host allocation a guest chooses.
+    capped_by_rm = bool(re.search(r"RMAPI_PARAM_COPY_MAX_PARAMS_SIZE\b(?!_PRIVILEGED)", rpc))
+    return dict(mask=masks["RM_GSS_LEGACY_MASK"],
+                capped_by_rm=capped_by_rm,
+                privileged=masks["RM_GSS_LEGACY_MASK_PRIVILEGED"],
+                max_params=max_params)
+
+
+def check_dispatch_order(ogkm):
+    """The deprecated and GSS paths are tried before the resource server.
+
+    If that ever stops being true the backend's ordering is wrong, and wrong in
+    the admitting direction: it would hand a command to the GSS rule that RM
+    had already sized and flagged.
+    """
+    text = open(os.path.join(ogkm, ENTRY_POINTS), errors="replace").read()
+    m = re.search(r"_nv04ControlWithSecInfo\s*\([^;{]*?\)\s*\n\{(.*?)\n\}", text, re.S)
+    if not m:
+        sys.exit(f"no _nv04ControlWithSecInfo in {ENTRY_POINTS}; the control entry point moved")
+    body = m.group(1)
+    dep = body.find("RmDeprecatedGetControlHandler")
+    norm = body.find("ControlWithSecInfo(pRmApi")
+    if dep < 0 or norm < 0 or dep > norm:
+        sys.exit(
+            f"{ENTRY_POINTS}: the deprecated handler is no longer consulted before the resource server; "
+            "the backend applies the two rules in RM's order and that order just changed"
+        )
+
+
+CATCH_ALL = ("BinaryApi",)
+
+
+def catch_all_classes(rows, allowed):
+    """Classes whose Control forwards any command, and the ranges that implies.
+
+    binapiControl is a passthrough: it hands the command and the parameter
+    block to GSP without an exported-method entry, so no control flag exists
+    for anything sent to one. What exists instead is the class split --
+    NV2081_BINAPI is RS_FLAGS_ALLOC_NON_PRIVILEGED, NV2082_BINAPI_PRIVILEGED is
+    RS_FLAGS_ALLOC_PRIVILEGED -- and the class allowlist already decides it.
+    A command is numbered with its class in the high half, so an allowed
+    catch-all class allows that half.
+    """
+    ok = {c["class_"] for c in allowed}
+    out = []
+    for r in rows:
+        if r["internal"] not in CATCH_ALL:
+            continue
+        cls = r.get("class_")
+        if cls is None or cls not in ok:
+            continue
+        out.append(dict(name=r["name"], class_=cls))
+    out.sort(key=lambda c: c["class_"])
+    return out
 
 
 def resource_entries(ogkm):
@@ -215,12 +458,18 @@ def resource_entries(ogkm):
     text = open(os.path.join(ogkm, RMAPI, "resource_list.h"), errors="replace").read()
     out = []
     for m in RS_ENTRY_RE.finditer(text):
-        out.append(dict(name=m.group(1), param=m.group(3) or m.group(4)))
+        out.append(dict(name=m.group("name"), internal=m.group("internal"),
+                        param=m.group("opt") or m.group("req")))
     return out
 
 
-def ctrl_probe(allow, idx):
-    """A C program printing `K <cmd> <params size>` for each allowed control."""
+def ctrl_probe(allow, deprecated, idx, defs, aliases):
+    """A C program printing the numbers the headers decide.
+
+    `K <cmd> <params size>` for each allowed control, and `D <legacy cmd>
+    <modern cmd> <legacy params size>` for each deprecated one -- the command
+    numbers are macros, so the compiler resolves them rather than this script.
+    """
     hdrs, rows, unresolved = set(), [], {}
     for cmd, t in sorted(allow.items()):
         if t is None:
@@ -232,14 +481,31 @@ def ctrl_probe(allow, idx):
             continue
         hdrs.add(h)
         rows.append((cmd, t))
+    dep, dep_unresolved = [], {}
+    for legacy, (target, old_params) in sorted(deprecated.items()):
+        want = {legacy: defs.get(legacy) and [defs[legacy]],
+                target: defs.get(target) and [defs[target]],
+                old_params: resolve_type(old_params, idx, defs, aliases)}
+        missing = sorted(n for n, h in want.items() if not h)
+        if missing:
+            # Left out, which refuses the legacy spelling -- and named, because
+            # a deprecated control RM still serves is one some userspace still
+            # calls.
+            dep_unresolved[legacy] = ", ".join(missing)
+            continue
+        for h in want.values():
+            hdrs.update(h)
+        dep.append((legacy, target, old_params))
     out = ["#include <stddef.h>", "#include <stdio.h>", '#include "nvtypes.h"', '#include "nvos.h"']
     out += [f'#include "{h}"' for h in sorted(hdrs)]
     out.append("int main(void) {")
     for cmd, t in rows:
         size = "0" if t is None else f"sizeof({t})"
         out.append(f'  printf("K {cmd:#x} %zu\\n", (size_t)({size}));')
+    for legacy, target, old_params in dep:
+        out.append(f'  printf("D %#x %#x %zu\\n", (unsigned)({legacy}), (unsigned)({target}), sizeof({old_params}));')
     out.append("  return 0;\n}")
-    return "\n".join(out), unresolved
+    return "\n".join(out), unresolved, dep_unresolved
 
 
 # resource_list.h is an X-macro table: RM includes it several times with a
@@ -333,12 +599,23 @@ def check_class_flags(ogkm):
         sys.exit("RS_FLAGS_NONE is no longer 0; re-read the rule")
 
 
-def allowed_classes(rows, drop):
-    """RM's own rule, applied to the probe's numbers."""
+def allowed_classes(rows, drop, clients):
+    """RM's own rule, applied to the probe's numbers.
+
+    _serverAllocValidatePrivilege in alloc_free.c, which rejects a class with
+    no privilege flag outright ("missing its privilege flag in RS_ENTRY"),
+    requires root for ALLOC_PRIVILEGED and kernel for ALLOC_KERNEL_PRIVILEGED.
+    The client classes never reach it; see client_classes().
+    """
     out, refused = [], {}
     for r in rows:
         name = r["name"]
         f = r["flags"]
+        if name in clients:
+            # Allocated by serverAllocClient. Every workload allocates one
+            # before it can do anything at all.
+            out.append(dict(class_=r["class_"], size=r["size"], required=r["required"], name=name))
+            continue
         if name in drop:
             bad = "not declared by the published SDK headers"
         elif not f & RS_ALLOC_NON_PRIVILEGED:
@@ -359,7 +636,7 @@ def allowed_classes(rows, drop):
     return out, refused
 
 
-def emit(rows, classes, version, stream):
+def emit(rows, classes, deprec, catch_all, gss, version, stream):
     ident = "v" + version.replace(".", "_")
     print("// Generated by gen/rmallow_extract.py -- do not edit by hand.", file=stream)
     print("//", file=stream)
@@ -369,7 +646,7 @@ def emit(rows, classes, version, stream):
     print(f"// The RM controls and classes driver {version} exports to an unprivileged", file=stream)
     print("// caller. A command or class that is not here is refused under every cap.", file=stream)
     print(file=stream)
-    print("use super::{AllowClass, AllowCtrl};", file=stream)
+    print("use super::{AllowClass, AllowCtrl, AllowRange, DeprecCtrl, GssRule};", file=stream)
     print(file=stream)
     # One row per line. These are lists a person has to be able to read down,
     # so they are built through a const constructor rather than as struct
@@ -377,6 +654,29 @@ def emit(rows, classes, version, stream):
     print("pub static CTRL: &[AllowCtrl] = &[", file=stream)
     for cmd, size in rows:
         print(f"    AllowCtrl::new({cmd:#010x}, {size}),", file=stream)
+    print("];", file=stream)
+    print(file=stream)
+    print("/// Commands RM rewrites into a modern one before anything else looks at", file=stream)
+    print("/// them. The modern command's flags decide; the size is the old struct's.", file=stream)
+    print("/// A hit here is final either way, because it is final in RM.", file=stream)
+    print("pub static DEPREC: &[DeprecCtrl] = &[", file=stream)
+    for d in deprec:
+        print(
+            f"    DeprecCtrl::new({d['cmd']:#010x}, {d['size']}, {str(d['allowed']).lower()}), "
+            f"// -> {d['target']:#010x}",
+            file=stream,
+        )
+    print("];", file=stream)
+    print(file=stream)
+    print("/// RM stopped implementing these and forwards them to GSP firmware. It", file=stream)
+    print("/// reads no parameter struct, so there is no size to check, only a cap.", file=stream)
+    print(f"pub static GSS: GssRule = GssRule::new({gss['mask']:#010x}, {gss['privileged']:#010x}, {gss['max_params']});", file=stream)
+    print(file=stream)
+    print("/// Classes whose control entry point forwards whatever it is handed. The", file=stream)
+    print("/// privilege is the class's, and the class table above already applied it.", file=stream)
+    print("pub static CATCH_ALL: &[AllowRange] = &[", file=stream)
+    for c in catch_all:
+        print(f"    AllowRange::new({c['class_']:#06x}), // {c['name']}", file=stream)
     print("];", file=stream)
     print(file=stream)
     print("pub static CLASS: &[AllowClass] = &[", file=stream)
@@ -402,15 +702,23 @@ def main():
     if not entries:
         sys.exit(f"no exported-method tables under {GEN}; is this an open-gpu-kernel-modules checkout?")
     allow, refused = allowed_controls(entries, flags)
+    check_dispatch_order(a.ogkm)
+    gss = gss_rule(a.ogkm)
+    deprecated = deprecated_controls(a.ogkm)
     types = type_index(a.ogkm)
     defs = define_index(a.ogkm)
-    src, unresolved = ctrl_probe(allow, types)
+    aliases = alias_index(a.ogkm)
+    src, unresolved, dep_unresolved = ctrl_probe(allow, deprecated, types, defs, aliases)
     csrc, rs_entries, drop = class_probe(a.ogkm, defs, types)
+    clients = client_classes(a.ogkm)
+    missing = clients - {e["name"] for e in rs_entries}
+    if missing:
+        sys.exit("bClientAlloc names classes resource_list.h does not: " + ", ".join(sorted(missing)))
 
     incs = ["-I", os.path.join(a.ogkm, INC), "-I", os.path.join(a.ogkm, "src/common/inc"),
             "-I", os.path.join(a.ogkm, RMAPI), "-I", os.path.join(a.ogkm, "src/common/sdk/nvidia/inc")]
     with tempfile.TemporaryDirectory() as d:
-        rows = []
+        rows, deprec_raw = [], []
         c = os.path.join(d, "ctrl.c")
         open(c, "w").write(src)
         exe = os.path.join(d, "ctrl")
@@ -422,6 +730,8 @@ def main():
             f = ln.split()
             if f and f[0] == "K":
                 rows.append((int(f[1], 16), int(f[2])))
+            elif f and f[0] == "D":
+                deprec_raw.append((int(f[1], 16), int(f[2], 16), int(f[3])))
 
         raw = []
         c = os.path.join(d, "class.c")
@@ -443,10 +753,33 @@ def main():
     # out -- resource_list.h has a #if around NV_CE_UTILS for debug builds.
     # Left out, which is the safe direction for an allowlist, and named.
     skipped = sorted({e["name"] for e in rs_entries} - {r["name"] for r in raw})
-    classes, class_refused = allowed_classes(raw, drop)
+    classes, class_refused = allowed_classes(raw, drop, clients)
+
+    # A legacy command is allowed exactly when the command it is rewritten into
+    # is. A target in no exported-method table at all is not a reading of
+    # anything, so it refuses -- and says so.
+    by_name = {e["name"]: e for e in rs_entries}
+    for r in raw:
+        r["internal"] = by_name.get(r["name"], {}).get("internal")
+    catch_all = catch_all_classes(raw, classes)
+    deprec, deprec_note = [], []
+    for cmd, target, size in sorted(deprec_raw):
+        if target in allow:
+            ok, why = True, None
+        elif target in refused:
+            ok, why = False, refused[target]
+        else:
+            ok, why = False, "the command it is rewritten into is in no exported-method table"
+        deprec.append(dict(cmd=cmd, target=target, size=size, allowed=ok))
+        if not ok:
+            deprec_note.append((cmd, target, why))
+
+    # A command with the GSS-legacy bit set never reaches the exported-method
+    # tables: RM takes the GSP branch first. Its flags, if it has any, are dead.
+    shadowed = sorted(c for c in set(allow) | set(refused) if c & gss["mask"])
 
     buf = io.StringIO()
-    emit(rows, classes, a.version, buf)
+    emit(rows, classes, deprec, catch_all, gss, a.version, buf)
     text = buf.getvalue()
     fmt = shutil.which("rustfmt")
     if fmt:
@@ -472,8 +805,33 @@ def main():
         sys.stderr.write("in resource_list.h but not compiled by this release (left out):\n")
         for n in skipped:
             sys.stderr.write(f"  {n}\n")
+    if dep_unresolved:
+        sys.stderr.write("deprecated, names this script could not resolve in the SDK headers (left out):\n")
+        for name, missing in sorted(dep_unresolved.items()):
+            sys.stderr.write(f"  {name}: {missing}\n")
+    if deprec_note:
+        sys.stderr.write("deprecated commands refused (RM rewrites them into something privileged):\n")
+        for cmd, target, why in deprec_note:
+            sys.stderr.write(f"  {cmd:#010x} -> {target:#010x}: {why}\n")
     sys.stderr.write(
-        f"{len(rs_entries)} classes: {len(classes)} allowed, "
+        f"{len(deprec)} deprecated commands: {sum(1 for d in deprec if d['allowed'])} allowed; "
+        f"GSP-forwarded commands keyed by {gss['mask']:#x}, root above {gss['privileged']:#x}, "
+        f"capped at {gss['max_params']} bytes; {len(catch_all)} catch-all classes\n"
+    )
+    if not gss["capped_by_rm"]:
+        sys.stderr.write(
+            "RmGssLegacyRpcCmd in this release applies no ceiling of its own; the backend's cap is "
+            "stricter than the driver it is talking to\n"
+        )
+    if shadowed:
+        sys.stderr.write(
+            f"{len(shadowed)} exported commands carry the GSS-legacy bit and never reach their own "
+            "table; RM forwards them to GSP and so does the backend:\n"
+        )
+        for c in shadowed:
+            sys.stderr.write(f"  {c:#010x}\n")
+    sys.stderr.write(
+        f"{len(rs_entries)} classes: {len(classes)} allowed ({len(clients)} of them clients), "
         f"{len(class_refused)} refused, {len(skipped)} not compiled\n"
     )
 

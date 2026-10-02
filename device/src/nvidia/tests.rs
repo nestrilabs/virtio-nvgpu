@@ -345,6 +345,11 @@ mod tests {
 
     fn backend_on(host: &CountingHost) -> (NvidiaBackend, u64) {
         let mut be = NvidiaBackend::for_test();
+        // A release, so the RM allowlist has tables to apply. Without one the
+        // backend refuses every control and class, which is the right default
+        // and is what `nothing_is_served_without_a_release` checks.
+        be.set_host_driver_version(abi::version::DriverVersion::new(615, 71, 9))
+            .expect("615.71.09 has tables");
         be.set_host(Box::new(host.clone()));
         let null = std::fs::File::open("/dev/null").expect("/dev/null");
         let h = be.handles.insert(OwnedFd::from(null));
@@ -393,6 +398,267 @@ mod tests {
             "host was called: {:x?}",
             host.calls()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // M4: RM's own privilege rule, applied on the guest's behalf.
+    //
+    // Each of these proves a refusal by what the fake host did *not* hear,
+    // which is the only evidence that distinguishes a refusal from a call
+    // that happened to fail.
+    // ------------------------------------------------------------------
+
+    fn rm_control(cmd: u32, params_size: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 32];
+        p[8..12].copy_from_slice(&cmd.to_le_bytes());
+        p[24..28].copy_from_slice(&params_size.to_le_bytes());
+        p
+    }
+
+    fn rm_alloc(class: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 48];
+        p[12..16].copy_from_slice(&class.to_le_bytes());
+        p
+    }
+
+    fn send(be: &mut NvidiaBackend, h: u64, escape: u32, params: &[u8]) -> Vec<u8> {
+        let mut resp = vec![0u8; 512];
+        be.dispatch(&ioctl_msg(h, escape, params), &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl itself must succeed");
+        resp
+    }
+
+    /// An ioctl whose top-level struct is followed by a nested block: the
+    /// allocation parameters of an RM_ALLOC, or the parameter block of an
+    /// RM_CONTROL. That block is what the pointer in the struct addresses, and
+    /// its length is what the backend sizes against.
+    fn send_nested(
+        be: &mut NvidiaBackend,
+        h: u64,
+        escape: u32,
+        top: &[u8],
+        nested: usize,
+    ) -> Vec<u8> {
+        let mut v = hdr(MsgType::Ioctl, h);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(escape, top.len() as u32) as u32,
+                data_len: top.len() as u32,
+                nested_offset: if nested > 0 { 16 } else { 0 },
+                nested_len: nested as u32,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(top);
+        v.extend_from_slice(&vec![0u8; nested]);
+        // Big enough for the refusal to come back whole: GET_PIDS alone
+        // carries a few thousand handles.
+        let mut resp = vec![0u8; 4096 + top.len() + nested];
+        be.dispatch(&v, &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl itself must succeed");
+        resp
+    }
+
+    fn send_alloc(be: &mut NvidiaBackend, h: u64, class: u32, nested: usize) -> Vec<u8> {
+        send_nested(be, h, abi::ioctl::NV_ESC_RM_ALLOC, &rm_alloc(class), nested)
+    }
+
+    fn send_control(
+        be: &mut NvidiaBackend,
+        h: u64,
+        cmd: u32,
+        declared: u32,
+        sent: usize,
+    ) -> Vec<u8> {
+        send_nested(
+            be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &rm_control(cmd, declared),
+            sent,
+        )
+    }
+
+    /// The whole point of the deny list. RM marks GET_PIDS non-privileged in
+    /// every release here, so the allowlist alone would forward it, and the
+    /// guest would get the host's process list.
+    #[test]
+    fn the_host_s_process_list_is_refused_and_never_asked_for() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let size = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.cmd == 0x2080018d)
+            .expect("GET_PIDS is in the table RM exports")
+            .params_size;
+
+        send_control(&mut be, h, 0x2080018d, size, size as usize);
+        assert!(
+            host.calls().is_empty(),
+            "the host was asked for its process list: {:x?}",
+            host.calls()
+        );
+    }
+
+    /// A control RM does not export to an unprivileged caller.
+    /// NV0000_CTRL_CMD_GPUACCT_SET_ACCOUNTING_STATE is privileged in RM
+    /// itself, so it is in no table.
+    #[test]
+    fn a_privileged_control_never_reaches_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        assert!(
+            !abi::rmallow::v615_71_09::CTRL
+                .iter()
+                .any(|e| e.cmd == 0x00000b01),
+            "SET_ACCOUNTING_STATE must not be in the allowlist"
+        );
+
+        send_control(&mut be, h, 0x00000b01, 8, 8);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+    }
+
+    /// The size has to be RM's size. A block that is not tells the host to
+    /// read or write a different number of bytes than the struct holds.
+    #[test]
+    fn a_control_at_the_wrong_size_never_reaches_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let e = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.params_size > 8 && abi::rmallow::denied(e.cmd).is_none())
+            .expect("some control has parameters");
+
+        send_control(
+            &mut be,
+            h,
+            e.cmd,
+            e.params_size - 4,
+            e.params_size as usize - 4,
+        );
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // Declaring RM's size and sending less is refused too: RM copies the
+        // declared number of bytes, so the rest would be whatever follows.
+        send_control(&mut be, h, e.cmd, e.params_size, e.params_size as usize - 4);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // ...and the same control at RM's size goes through, or the tests
+        // above would pass for the wrong reason.
+        send_control(&mut be, h, e.cmd, e.params_size, e.params_size as usize);
+        assert_eq!(host.calls().len(), 1, "{:x?}", host.calls());
+    }
+
+    /// The three controls the probe runs caught the backend refusing while
+    /// draw, encode and Vulkan all still needed them. None has a control flag
+    /// anywhere, because none of them reaches the exported-method tables: RM
+    /// rewrites the first, forwards the second to GSP firmware, and hands the
+    /// third to a class whose control is a passthrough.
+    #[test]
+    fn the_controls_rm_serves_without_a_control_flag_reach_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+
+        // NV2080_CTRL_CMD_FB_GET_INFO, rewritten into FB_GET_INFO_V2. The
+        // size is the legacy struct's, not the modern one's.
+        send_control(&mut be, h, 0x2080_1301, 16, 16);
+        assert_eq!(host.calls().len(), 1, "{:x?}", host.calls());
+
+        // A GSP-forwarded command. RM reads no struct, so any size up to its
+        // ceiling is RM's business and not the backend's.
+        send_control(&mut be, h, 0x2080_852e, 64, 64);
+        assert_eq!(host.calls().len(), 2, "{:x?}", host.calls());
+
+        // A command for NV2081_BINAPI, whose control forwards anything.
+        send_control(&mut be, h, 0x2081_0108, 32, 32);
+        assert_eq!(host.calls().len(), 3, "{:x?}", host.calls());
+    }
+
+    /// The same paths refuse. Each of these is the thing the rule above exists
+    /// to let through, with the one bit changed that RM refuses on.
+    #[test]
+    fn the_same_paths_refuse_what_rm_refuses() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+
+        // Rewritten into a command RM marks privileged.
+        send_control(&mut be, h, 0x0073_136a, 64, 64);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // The same GSP-forwarded command with RM's privileged bits set: RM
+        // answers that one to root only, and the backend is root on nobody's
+        // behalf.
+        send_control(&mut be, h, 0x2080_c52e, 64, 64);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // RM copies no more than this for an unprivileged caller, and a size
+        // RM will not copy is a host allocation sized by the guest.
+        let max = be
+            .rmallow
+            .expect("the fixture learned a release")
+            .max_params();
+        send_control(&mut be, h, 0x2080_852e, max + 1, 64);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // The privileged twin of the catch-all class. RM has two classes here
+        // so that exactly this is refused.
+        send_control(&mut be, h, 0x2082_0108, 32, 32);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+    }
+
+    /// A class RM does not let an unprivileged caller allocate.
+    #[test]
+    fn a_class_rm_does_not_export_never_reaches_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let class = 0x0000dead;
+        assert!(
+            !abi::rmallow::v615_71_09::CLASS
+                .iter()
+                .any(|c| c.class_id == class)
+        );
+
+        send_alloc(&mut be, h, class, 0);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+    }
+
+    /// RS_REQUIRED means the allocation parameters have to be there.
+    #[test]
+    fn a_class_that_requires_parameters_is_refused_without_them() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let c = abi::rmallow::v615_71_09::CLASS
+            .iter()
+            .find(|c| c.params_required)
+            .expect("some class requires parameters");
+
+        send_alloc(&mut be, h, c.class_id, 0);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // Short is refused too: RM reads its own struct's worth of bytes
+        // through pAllocParms, so a short block is a read past what was sent.
+        send_alloc(&mut be, h, c.class_id, c.params_size as usize - 4);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        send_alloc(&mut be, h, c.class_id, c.params_size as usize);
+        assert_eq!(host.calls().len(), 1, "{:x?}", host.calls());
+    }
+
+    /// A backend that never learned the host's release has no rule to apply,
+    /// so it applies none of the guest's traffic to the host.
+    #[test]
+    fn nothing_is_served_without_a_release() {
+        let host = CountingHost::default();
+        let mut be = NvidiaBackend::for_test();
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+
+        send_alloc(&mut be, h, 0xc7b7, 12);
+        send_control(&mut be, h, 0x20800110, 8, 8);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
     }
 
     #[test]

@@ -6,7 +6,7 @@
 // The RM controls and classes driver 595.104.02 exports to an unprivileged
 // caller. A command or class that is not here is refused under every cap.
 
-use super::{AllowClass, AllowCtrl};
+use super::{AllowClass, AllowCtrl, AllowRange, DeprecCtrl, GssRule};
 
 pub static CTRL: &[AllowCtrl] = &[
     AllowCtrl::new(0x00000102, 108),
@@ -753,7 +753,33 @@ pub static CTRL: &[AllowCtrl] = &[
     AllowCtrl::new(0xcbca0104, 1),
 ];
 
+/// Commands RM rewrites into a modern one before anything else looks at
+/// them. The modern command's flags decide; the size is the old struct's.
+/// A hit here is final either way, because it is final in RM.
+pub static DEPREC: &[DeprecCtrl] = &[
+    DeprecCtrl::new(0x00000101, 40, true),  // -> 0x0000013e
+    DeprecCtrl::new(0x0073136a, 64, false), // -> 0x00731381
+    DeprecCtrl::new(0x00801b01, 16, true),  // -> 0x00801b02
+    DeprecCtrl::new(0x00801c01, 24, true),  // -> 0x00801c02
+    DeprecCtrl::new(0x20800101, 16, true),  // -> 0x20800102
+    DeprecCtrl::new(0x20800802, 16, true),  // -> 0x20800810
+    DeprecCtrl::new(0x20801301, 16, true),  // -> 0x20801303
+    DeprecCtrl::new(0x20801802, 16, true),  // -> 0x20801823
+];
+
+/// RM stopped implementing these and forwards them to GSP firmware. It
+/// reads no parameter struct, so there is no size to check, only a cap.
+pub static GSS: GssRule = GssRule::new(0x00008000, 0x0000c000, 1048576);
+
+/// Classes whose control entry point forwards whatever it is handed. The
+/// privilege is the class's, and the class table above already applied it.
+pub static CATCH_ALL: &[AllowRange] = &[
+    AllowRange::new(0x2081), // NV2081_BINAPI
+];
+
 pub static CLASS: &[AllowClass] = &[
+    AllowClass::new(0x00000000, 4, false),  // NV01_ROOT
+    AllowClass::new(0x00000001, 4, false),  // NV01_ROOT_NON_PRIV
     AllowClass::new(0x00000002, 32, true),  // NV01_CONTEXT_DMA
     AllowClass::new(0x00000004, 0, false),  // NV01_TIMER
     AllowClass::new(0x00000005, 24, true),  // NV01_EVENT
@@ -762,6 +788,7 @@ pub static CLASS: &[AllowClass] = &[
     AllowClass::new(0x0000003e, 128, true), // NV01_MEMORY_SYSTEM
     AllowClass::new(0x0000003f, 0, false),  // NV01_MEMORY_LOCAL_PRIVILEGED
     AllowClass::new(0x00000040, 128, true), // NV01_MEMORY_LOCAL_USER
+    AllowClass::new(0x00000041, 4, false),  // NV01_ROOT_CLIENT
     AllowClass::new(0x00000060, 4, true),   // NV0060_SYNC_GPU_BOOST
     AllowClass::new(0x00000070, 24, true),  // NV01_MEMORY_VIRTUAL
     AllowClass::new(0x00000071, 40, true),  // NV01_MEMORY_SYSTEM_OS_DESCRIPTOR

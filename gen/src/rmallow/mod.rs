@@ -72,6 +72,97 @@ impl AllowClass {
     }
 }
 
+/// One command RM rewrites into a modern one before anything else sees it.
+///
+/// `_nv04ControlWithSecInfo` consults RM's deprecated table first and only
+/// falls through to the resource server if it misses, so a hit here is final
+/// in RM and final here too. The converter reissues the call with the caller's
+/// own security info, which is why `allowed` is the *modern* command's
+/// privilege -- and why `params_size` is the *old* struct's, since that is
+/// what the guest sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeprecCtrl {
+    pub cmd: u32,
+    pub params_size: u32,
+    pub allowed: bool,
+}
+
+impl DeprecCtrl {
+    pub const fn new(cmd: u32, params_size: u32, allowed: bool) -> Self {
+        Self {
+            cmd,
+            params_size,
+            allowed,
+        }
+    }
+}
+
+/// A class whose control entry point forwards whatever it is handed.
+///
+/// `binapiControl` passes the command and the parameter block to GSP without
+/// an exported-method entry, so there is no control flag for anything sent to
+/// one. The privilege is the class's instead, and RM says it by having two
+/// classes: `NV2081_BINAPI` non-privileged, `NV2082_BINAPI_PRIVILEGED` not.
+/// Only a class the class table already permits gets a range here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllowRange {
+    pub class_id: u32,
+}
+
+impl AllowRange {
+    pub const fn new(class_id: u32) -> Self {
+        Self { class_id }
+    }
+
+    /// Commands are numbered with their class in the high half.
+    pub const fn holds(&self, cmd: u32) -> bool {
+        cmd >> 16 == self.class_id
+    }
+}
+
+/// RM's rule for the commands it no longer implements and forwards to GSP.
+///
+/// There are no flags for these anywhere; the rule is in the command number.
+/// `RmGssLegacyRpcCmd` refuses a non-root caller any command matching
+/// `privileged` in full, and forwards the rest to firmware unread -- so there
+/// is no parameter size to check, only the ceiling RM applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GssRule {
+    pub mask: u32,
+    pub privileged: u32,
+    pub max_params: u32,
+}
+
+impl GssRule {
+    pub const fn new(mask: u32, privileged: u32, max_params: u32) -> Self {
+        Self {
+            mask,
+            privileged,
+            max_params,
+        }
+    }
+
+    /// Whether RM takes the GSP branch for this command at all.
+    pub const fn holds(&self, cmd: u32) -> bool {
+        cmd & self.mask != 0
+    }
+
+    /// RM's own test, copied: the privileged bits set in full means root.
+    pub const fn needs_root(&self, cmd: u32) -> bool {
+        cmd & self.privileged == self.privileged
+    }
+}
+
+/// What the rule says about a command, when it says yes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CtrlAllow {
+    /// RM sizes this from its own descriptor, so the block must be exact.
+    Exact(u32),
+    /// RM forwards this without reading it and only caps it. There is no
+    /// size to require, so the backend requires no more than RM does.
+    UpTo(u32),
+}
+
 /// Controls refused under every cap, whatever RM says about them.
 ///
 /// RM marks all of these non-privileged, and for RM's own purposes that is
@@ -123,6 +214,9 @@ struct Profile {
     /// const-evaluated and the table can end up copied per use.
     ctrl: fn() -> &'static [AllowCtrl],
     class: fn() -> &'static [AllowClass],
+    deprec: fn() -> &'static [DeprecCtrl],
+    catch_all: fn() -> &'static [AllowRange],
+    gss: fn() -> GssRule,
 }
 
 /// Profiles in ascending version order.
@@ -131,26 +225,41 @@ static PROFILES: &[Profile] = &[
         version: DriverVersion::new(535, 129, 3),
         ctrl: || v535_129_03::CTRL,
         class: || v535_129_03::CLASS,
+        deprec: || v535_129_03::DEPREC,
+        catch_all: || v535_129_03::CATCH_ALL,
+        gss: || v535_129_03::GSS,
     },
     Profile {
         version: DriverVersion::new(580, 178, 4),
         ctrl: || v580_178_04::CTRL,
         class: || v580_178_04::CLASS,
+        deprec: || v580_178_04::DEPREC,
+        catch_all: || v580_178_04::CATCH_ALL,
+        gss: || v580_178_04::GSS,
     },
     Profile {
         version: DriverVersion::new(595, 71, 5),
         ctrl: || v595_71_05::CTRL,
         class: || v595_71_05::CLASS,
+        deprec: || v595_71_05::DEPREC,
+        catch_all: || v595_71_05::CATCH_ALL,
+        gss: || v595_71_05::GSS,
     },
     Profile {
         version: DriverVersion::new(595, 104, 2),
         ctrl: || v595_104_02::CTRL,
         class: || v595_104_02::CLASS,
+        deprec: || v595_104_02::DEPREC,
+        catch_all: || v595_104_02::CATCH_ALL,
+        gss: || v595_104_02::GSS,
     },
     Profile {
         version: DriverVersion::new(615, 71, 9),
         ctrl: || v615_71_09::CTRL,
         class: || v615_71_09::CLASS,
+        deprec: || v615_71_09::DEPREC,
+        catch_all: || v615_71_09::CATCH_ALL,
+        gss: || v615_71_09::GSS,
     },
 ];
 
@@ -159,6 +268,9 @@ static PROFILES: &[Profile] = &[
 pub struct Selected {
     pub ctrl: &'static [AllowCtrl],
     pub class: &'static [AllowClass],
+    pub deprec: &'static [DeprecCtrl],
+    pub catch_all: &'static [AllowRange],
+    pub gss: GssRule,
     /// The host release has tables of its own. When false these are an older
     /// release's, and what they permit for a newer release is an assumption.
     pub exact: bool,
@@ -170,7 +282,7 @@ pub struct Selected {
 /// control a newer release added is absent here and so refused. The other
 /// direction is the live one: a release can take a control that *was*
 /// non-privileged and make it privileged, and an older table would still
-/// permit it. [`Selected::ctrl_entry`] closes that by requiring every release
+/// permit it. [`Selected::ctrl_rule`] closes that by requiring every release
 /// to agree whenever the table is not the host's own.
 pub fn select(v: DriverVersion) -> Option<Selected> {
     PROFILES
@@ -180,11 +292,21 @@ pub fn select(v: DriverVersion) -> Option<Selected> {
         .map(|p| Selected {
             ctrl: (p.ctrl)(),
             class: (p.class)(),
+            deprec: (p.deprec)(),
+            catch_all: (p.catch_all)(),
+            gss: (p.gss)(),
             exact: p.version == v,
         })
 }
 
 fn find_ctrl(table: &'static [AllowCtrl], cmd: u32) -> Option<&'static AllowCtrl> {
+    table
+        .binary_search_by_key(&cmd, |e| e.cmd)
+        .ok()
+        .map(|i| &table[i])
+}
+
+fn find_deprec(table: &'static [DeprecCtrl], cmd: u32) -> Option<&'static DeprecCtrl> {
     table
         .binary_search_by_key(&cmd, |e| e.cmd)
         .ok()
@@ -199,36 +321,98 @@ fn find_class(table: &'static [AllowClass], class_id: u32) -> Option<&'static Al
 }
 
 impl Selected {
-    /// The entry permitting this control, if every table that has to agree
-    /// does.
+    /// What the rule says about this control, in the order RM asks.
     ///
-    /// On an exact table this is a lookup. On an older one it is a lookup in
-    /// each release: the control has to be non-privileged in all of them, at
-    /// the same parameter size, or the backend is permitting on the strength
-    /// of a table that does not describe the driver it is talking to.
-    pub fn ctrl_entry(&self, cmd: u32) -> Option<&'static AllowCtrl> {
+    /// RM's control entry point tries three things, and so does this. The
+    /// order is not a detail: a command the deprecated table claims never
+    /// reaches the exported-method tables, and a command with the GSS-legacy
+    /// bit set never reaches them either, so reading their flags first would
+    /// be reading flags RM ignores.
+    ///
+    ///   1. The deprecated table. A hit is final, allowed or not, because it
+    ///      is final in RM.
+    ///   2. The GSP-forwarded commands, whose privilege is a bit in the
+    ///      command number and whose size RM never checks.
+    ///   3. The exported-method tables, which carry real flags and a real
+    ///      size -- and failing those, a class whose control forwards
+    ///      everything, where the class table already decided.
+    ///
+    /// On a table that is not the host release's own, every release has to
+    /// agree before anything is permitted. Nearest-older is safe for what a
+    /// newer release *added*; it is not safe for what a newer release made
+    /// privileged, and that is what the agreement closes.
+    pub fn ctrl_rule(&self, cmd: u32) -> Option<CtrlAllow> {
         if denied(cmd).is_some() {
             return None;
         }
-        let e = find_ctrl(self.ctrl, cmd)?;
+        if let Some(e) = find_deprec(self.deprec, cmd) {
+            if !e.allowed || !self.agreed(|p| find_deprec((p.deprec)(), cmd) == Some(e)) {
+                return None;
+            }
+            return Some(CtrlAllow::Exact(e.params_size));
+        }
+        if self.gss.holds(cmd) {
+            // Only the privilege bits have to agree. The ceiling is a number
+            // each release picks for itself -- 580.178.04 says 1 MiB where
+            // 615.71.09 says 2 -- and disagreeing about it is not a reason to
+            // refuse, it is a reason to take the smallest.
+            let same = |p: &Profile| {
+                let g = (p.gss)();
+                g.mask == self.gss.mask && g.privileged == self.gss.privileged
+            };
+            if self.gss.needs_root(cmd) || !self.agreed(same) {
+                return None;
+            }
+            return Some(CtrlAllow::UpTo(self.max_params()));
+        }
+        if let Some(e) = find_ctrl(self.ctrl, cmd) {
+            if !self.agreed(|p| {
+                find_ctrl((p.ctrl)(), cmd).is_some_and(|o| o.params_size == e.params_size)
+            }) {
+                return None;
+            }
+            return Some(CtrlAllow::Exact(e.params_size));
+        }
+        // No exported-method entry anywhere. RM would hand this to the
+        // resource's own control, which for most classes is a refusal and for
+        // a catch-all class is a forward to firmware. Permitting the range
+        // rests entirely on the class table having permitted the class.
+        // The cap is the same one: RM has a single RMAPI_PARAM_COPY_MAX_PARAMS_SIZE
+        // for every non-privileged parameter block it copies in.
+        let r = self.catch_all.iter().find(|r| r.holds(cmd))?;
+        if !self.agreed(|p| (p.catch_all)().contains(r)) {
+            return None;
+        }
+        Some(CtrlAllow::UpTo(self.max_params()))
+    }
+
+    /// The largest parameter block RM will copy for an unprivileged caller:
+    /// this release's own number, or the smallest any release gives when the
+    /// tables are not the host's.
+    ///
+    /// 535.129.03 enforces no ceiling on the GSP path at all. This one is
+    /// applied anyway -- a size RM does not bound is a host allocation the
+    /// guest chooses the size of.
+    pub fn max_params(&self) -> u32 {
         if self.exact {
-            return Some(e);
+            return self.gss.max_params;
         }
         PROFILES
             .iter()
-            .all(|p| find_ctrl((p.ctrl)(), cmd).is_some_and(|o| o.params_size == e.params_size))
-            .then_some(e)
+            .map(|p| (p.gss)().max_params)
+            .min()
+            .unwrap_or(self.gss.max_params)
+    }
+
+    /// True if the host release has its own tables, or every release agrees.
+    fn agreed(&self, f: impl Fn(&Profile) -> bool) -> bool {
+        self.exact || PROFILES.iter().all(f)
     }
 
     /// The entry permitting this class, under the same rule.
     pub fn class_entry(&self, class_id: u32) -> Option<&'static AllowClass> {
         let e = find_class(self.class, class_id)?;
-        if self.exact {
-            return Some(e);
-        }
-        PROFILES
-            .iter()
-            .all(|p| find_class((p.class)(), class_id).is_some_and(|o| o == e))
+        self.agreed(|p| find_class((p.class)(), class_id).is_some_and(|o| o == e))
             .then_some(e)
     }
 }
@@ -282,9 +466,36 @@ mod tests {
                 .any(|p| find_ctrl((p.ctrl)(), *cmd).is_some());
             assert!(found, "{name} is in no table; the deny entry is stale");
             let sel = select(v(615, 71, 9)).unwrap();
+            assert!(sel.ctrl_rule(*cmd).is_none(), "{name} passed the allowlist");
+        }
+    }
+
+    /// The three classes RM allocates as clients carry no privilege flag in
+    /// RS_ENTRY, because they never reach the check that wants one -- RM names
+    /// them in `bClientAlloc` and routes them to `serverAllocClient`. A rule
+    /// that asks them for a flag refuses every workload at its first call,
+    /// which is what this one did until the generator read that branch.
+    #[test]
+    fn the_client_classes_are_allowed_everywhere() {
+        for (id, name) in [
+            (0x00000000, "NV01_ROOT"),
+            (0x00000001, "NV01_ROOT_NON_PRIV"),
+            (0x00000041, "NV01_ROOT_CLIENT"),
+        ] {
+            for p in PROFILES {
+                assert!(
+                    find_class((p.class)(), id).is_some(),
+                    "{name} missing from {}",
+                    p.version
+                );
+            }
             assert!(
-                sel.ctrl_entry(*cmd).is_none(),
-                "{name} passed the allowlist"
+                select(v(615, 71, 9)).unwrap().class_entry(id).is_some(),
+                "{name}"
+            );
+            assert!(
+                select(v(615, 80, 0)).unwrap().class_entry(id).is_some(),
+                "{name} on a fallback"
             );
         }
     }
@@ -305,6 +516,103 @@ mod tests {
         assert!(select(v(500, 0, 0)).is_none());
     }
 
+    /// RM's control entry point tries the deprecated table, then the
+    /// GSP-forwarded commands, then the resource server, and the privilege
+    /// rule is different in each. These are the commands the probe runs found
+    /// the backend refusing while every workload still needed them.
+    #[test]
+    fn the_paths_that_carry_no_control_flag() {
+        let sel = select(v(615, 71, 9)).unwrap();
+
+        // Rewritten into a modern command whose flags do permit it. The size
+        // is the old struct's, which is smaller than the V2 one.
+        assert_eq!(
+            sel.ctrl_rule(0x2080_1301), // NV2080_CTRL_CMD_FB_GET_INFO
+            Some(CtrlAllow::Exact(16)),
+            "RM rewrites FB_GET_INFO into FB_GET_INFO_V2 and serves it"
+        );
+        assert_eq!(sel.ctrl_rule(0x2080_1802), Some(CtrlAllow::Exact(16)));
+
+        // Forwarded to GSP firmware, which RM does not size.
+        for cmd in [0x2080_852e, 0x2080_a612, 0x2080_a618, 0x2080_9009] {
+            assert_eq!(
+                sel.ctrl_rule(cmd),
+                Some(CtrlAllow::UpTo(sel.gss.max_params)),
+                "{cmd:#x} sets the GSS-legacy bit and RM forwards it"
+            );
+        }
+
+        // Sent to a BinaryApi object, whose control forwards anything.
+        assert_eq!(
+            sel.ctrl_rule(0x2081_0108),
+            Some(CtrlAllow::UpTo(sel.gss.max_params)),
+            "NV2081_BINAPI is a non-privileged class and its control is a passthrough"
+        );
+    }
+
+    /// The same three paths refuse. Without this the test above only proves
+    /// the rule says yes, which any broken rule also does.
+    #[test]
+    fn the_same_paths_still_refuse() {
+        let sel = select(v(615, 71, 9)).unwrap();
+
+        // NV0073_CTRL_CMD_DP_SET_MSA_PROPERTIES: in RM's deprecated table, and
+        // rewritten into a V2 command RM marks privileged. A hit in that table
+        // is final in RM, so it must be final here -- it must not fall through
+        // to the GSS rule or the exported-method tables and get a second
+        // chance at a yes.
+        assert_eq!(sel.ctrl_rule(0x0073_136a), None);
+        assert!(
+            find_deprec(sel.deprec, 0x0073_136a).is_some_and(|e| !e.allowed),
+            "the refusal has to come from the deprecated table, not from a miss"
+        );
+
+        // RM's own rule for a GSP-forwarded command: the privileged bits set
+        // in full means root, and the backend is not root on the guest's
+        // behalf. 0x2080c52e is 0x2080852e with the privileged half set.
+        assert!(sel.gss.holds(0x2080_c52e));
+        assert!(sel.gss.needs_root(0x2080_c52e));
+        assert_eq!(sel.ctrl_rule(0x2080_c52e), None);
+
+        // The privileged twin of the catch-all class. RM has two classes here
+        // precisely so that this one is refused, and the class table refuses
+        // NV2082_BINAPI_PRIVILEGED, so no range covers its commands.
+        assert_eq!(sel.class_entry(0x2082), None);
+        assert_eq!(sel.ctrl_rule(0x2082_0108), None);
+    }
+
+    /// Every catch-all range belongs to a class the class table permits. The
+    /// range is only defensible because the class was.
+    #[test]
+    fn a_catch_all_range_is_backed_by_an_allowed_class() {
+        for p in PROFILES {
+            let sel = select(p.version).unwrap();
+            for r in (p.catch_all)() {
+                assert!(
+                    sel.class_entry(r.class_id).is_some(),
+                    "{} admits commands for class {:#x} it will not allocate",
+                    p.version,
+                    r.class_id
+                );
+            }
+        }
+    }
+
+    /// The ceiling differs between releases -- 580.178.04 says 1 MiB where
+    /// 615.71.09 says 2 -- so a fallback takes the smallest rather than the
+    /// one that happens to be nearest.
+    #[test]
+    fn a_fallback_caps_at_the_smallest_any_release_gives() {
+        let smallest = PROFILES.iter().map(|p| (p.gss)().max_params).min().unwrap();
+        let newest = select(v(615, 71, 9)).unwrap();
+        assert_eq!(newest.max_params(), newest.gss.max_params);
+        assert!(
+            smallest < newest.gss.max_params,
+            "the releases agree on the ceiling; this test is no longer testing anything"
+        );
+        assert_eq!(select(v(615, 80, 0)).unwrap().max_params(), smallest);
+    }
+
     /// On a fallback, a control only one release permits is refused: the
     /// backend would be permitting on the strength of a table that does not
     /// describe the host.
@@ -319,9 +627,9 @@ mod tests {
             })
             .expect("the releases differ somewhere");
         let exact = select(v(615, 71, 9)).unwrap();
-        assert!(exact.ctrl_entry(only_newest.cmd).is_some());
+        assert!(exact.ctrl_rule(only_newest.cmd).is_some());
         let fallback = select(v(615, 80, 0)).unwrap();
-        assert!(fallback.ctrl_entry(only_newest.cmd).is_none());
+        assert!(fallback.ctrl_rule(only_newest.cmd).is_none());
     }
 
     /// A control every release agrees on survives the fallback, or the rule
@@ -339,7 +647,7 @@ mod tests {
         assert!(
             select(v(615, 80, 0))
                 .unwrap()
-                .ctrl_entry(common.cmd)
+                .ctrl_rule(common.cmd)
                 .is_some()
         );
     }

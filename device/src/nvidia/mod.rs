@@ -229,6 +229,21 @@ pub struct NvidiaBackend {
     /// `driver`, and whether the table is this release's own. `None` until the
     /// release is known; the backend refuses to start without one.
     rmctrl: Option<abi::rmctrl::Selected>,
+    /// The controls and classes RM exports to an unprivileged caller, for
+    /// `driver`, and whether the tables are this release's own. `None` until
+    /// the release is known; the backend refuses to start without them.
+    ///
+    /// RM applies this rule to the *backend*, which is a service account on
+    /// the host, not to the guest. So the backend applies it on the guest's
+    /// behalf, before forwarding. See `abi::rmallow`.
+    rmallow: Option<abi::rmallow::Selected>,
+    /// Controls and classes refused by the RM allowlist, by what was asked
+    /// for and why. Reported at teardown.
+    ///
+    /// Separate from `caps_refused`: a capability being off is a decision
+    /// somebody made on the command line, and this is RM's own rule. A probe
+    /// that regresses needs to say which of the two stopped it.
+    allow_refused: std::collections::BTreeMap<String, u64>,
     /// Where device memory is placed so the guest can address it. `None` until
     /// the transport supplies one, and without it a mapping can be made on the
     /// host but never reached from the guest.
@@ -331,6 +346,8 @@ impl NvidiaBackend {
             rmctrl: None,
             caps: crate::caps::Caps::DEFAULT,
             caps_refused: std::collections::BTreeMap::new(),
+            rmallow: None,
+            allow_refused: std::collections::BTreeMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: std::collections::BTreeMap::new(),
             rm_controls: std::collections::BTreeMap::new(),
@@ -413,9 +430,23 @@ impl NvidiaBackend {
             return Err(format!("host driver {v} has no RM pointer table"));
         };
         self.rmctrl = Some(sel);
+        // Likewise for the allowlist: without it the backend would forward
+        // every control RM is willing to run for a service account, which is
+        // most of them.
+        let Some(allow) = abi::rmallow::select(v) else {
+            return Err(format!("host driver {v} has no RM allowlist"));
+        };
+        self.rmallow = Some(allow);
         log::info!(
             "host driver {v}: {} RM controls carry a pointer RM dereferences",
             sel.table.len()
+        );
+        log::info!(
+            "host driver {v}: RM exports {} controls and {} classes to an unprivileged caller, \
+             less {} refused under every cap",
+            allow.ctrl.len(),
+            allow.class.len(),
+            abi::rmallow::DENY.len()
         );
         if !sel.exact {
             // The table is an older release's. It cannot describe a control
@@ -500,6 +531,16 @@ impl NvidiaBackend {
             self.handles.len(),
             self.active_maps.len()
         );
+        if !self.allow_refused.is_empty() {
+            log::warn!(
+                "NvidiaBackend::teardown: refused by the RM allowlist: {}",
+                self.allow_refused
+                    .iter()
+                    .map(|(k, n)| format!("{k} x{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         if !self.caps_refused.is_empty() {
             log::warn!(
                 "NvidiaBackend::teardown: refused for want of a capability: {}",

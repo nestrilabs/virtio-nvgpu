@@ -32,6 +32,7 @@ impl NvidiaBackend {
         // no pointer table, and every control that carries a pointer would go
         // through undescribed, which is what this crate stopped doing in M3.
         self.rmctrl = abi::rmctrl::select(v);
+        self.rmallow = abi::rmallow::select(v);
         match self.abi {
             Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
             None => log::warn!(
@@ -69,6 +70,145 @@ impl NvidiaBackend {
         }
         out[NVOS64_STATUS..NVOS64_STATUS + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
         self.write_ioctl_resp(resp_buf, cookie, &out)
+    }
+
+    /// Whether RM exports this control to an unprivileged caller.
+    ///
+    /// Returns why not, for the log and the teardown tally. The order matters:
+    /// the deny list is consulted before the table, because every entry on it
+    /// *is* in the table -- RM marks them non-privileged and means it.
+    fn rm_control_refusal(&self, cmd: u32, declared: u32, sent: u32) -> Option<String> {
+        if let Some(name) = abi::rmallow::denied(cmd) {
+            return Some(format!("{name} answers about the host, not this guest"));
+        }
+        // No allowlist at all means nothing can be said about any control.
+        // Unreachable through `set_host_driver_version`, which refuses to
+        // start without one; reachable by another VMM embedding this crate.
+        let Some(sel) = self.rmallow else {
+            return Some("no RM allowlist for this host".into());
+        };
+        let Some(rule) = sel.ctrl_rule(cmd) else {
+            return Some(if sel.exact {
+                "RM does not serve it to an unprivileged caller".into()
+            } else {
+                // Either RM never served it, or the table is an older
+                // release's and the releases disagree. Both end here.
+                "no release this backend knows serves it to an unprivileged caller".into()
+            });
+        };
+        match rule {
+            // RM sizes this from its own descriptor, so the block has to be
+            // exactly that size and the guest has to have sent all of it.
+            abi::rmallow::CtrlAllow::Exact(want) => {
+                if declared != want {
+                    return Some(format!(
+                        "parameters are declared {declared} bytes, RM's are {want}"
+                    ));
+                }
+            }
+            // RM reads nothing here -- it hands the block to GSP firmware --
+            // so there is no size to require, only the ceiling RM puts on a
+            // parameter copy for an unprivileged caller.
+            abi::rmallow::CtrlAllow::UpTo(max) => {
+                if declared > max {
+                    return Some(format!(
+                        "parameters are declared {declared} bytes, more than the {max} RM copies"
+                    ));
+                }
+            }
+        }
+        (sent != declared)
+            .then(|| format!("parameters are declared {declared} bytes and {sent} arrived"))
+    }
+
+    /// Whether RM lets an unprivileged caller allocate this class.
+    ///
+    /// `have` is the length of the allocation parameters the guest actually
+    /// sent -- the nested block, which is what `pAllocParms` addresses -- and
+    /// not the `paramsSize` in its NVOS64. RM never reads that field to size an
+    /// allocation: `NV_ESC_RM_ALLOC` also accepts NVOS21, which has no such
+    /// field, and RM takes the size from its own resource descriptor either
+    /// way. NVIDIA's userspace leaves it zero, so checking it refused every
+    /// workload at its first VA space (`FERMI_VASPACE_A`).
+    fn rm_class_refusal(&self, class: u32, have: usize) -> Option<String> {
+        let Some(sel) = self.rmallow else {
+            return Some("no RM allowlist for this host".into());
+        };
+        let Some(entry) = sel.class_entry(class) else {
+            return Some(if sel.exact {
+                "RM does not let an unprivileged caller allocate it".into()
+            } else {
+                "no release this backend knows lets an unprivileged caller allocate it".into()
+            });
+        };
+        // RS_OPTIONAL means the parameters may be absent entirely; RS_REQUIRED
+        // means they may not. Either way, if they are there they are the size
+        // RM's own struct is: RM reads that many bytes through pAllocParms, so
+        // a shorter block is a read past what the guest sent.
+        if have == 0 {
+            return entry
+                .params_required
+                .then(|| "RM requires allocation parameters and none were sent".to_string());
+        }
+        (have != entry.params_size as usize).then(|| {
+            format!(
+                "allocation parameters are {have} bytes, RM's are {}",
+                entry.params_size
+            )
+        })
+    }
+
+    /// Answer an RM_CONTROL the allowlist refused, without calling the host.
+    ///
+    /// The status goes in the parameter block and the ioctl succeeds. An errno
+    /// here makes NVIDIA's userspace retry or hang; a status it reads is an
+    /// answer it knows what to do with.
+    pub(super) fn refuse_control(
+        &mut self,
+        cookie: u64,
+        cmd: u32,
+        why: String,
+        param_in: &[u8],
+        resp_buf: &mut [u8],
+    ) -> usize {
+        const NVOS54_STATUS: usize = 28;
+        const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
+        self.note_allow_refusal(format!("RM_CONTROL cmd {cmd:#010x}"), why);
+        let mut out = param_in.to_vec();
+        if out.len() < NVOS54_STATUS + 4 {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        }
+        out[NVOS54_STATUS..NVOS54_STATUS + 4].copy_from_slice(&NV_ERR_NOT_SUPPORTED.to_le_bytes());
+        self.write_ioctl_resp(resp_buf, cookie, &out)
+    }
+
+    /// Answer an RM_ALLOC the allowlist refused, without calling the host.
+    pub(super) fn refuse_alloc(
+        &mut self,
+        cookie: u64,
+        class: u32,
+        why: String,
+        param_in: &[u8],
+        resp_buf: &mut [u8],
+    ) -> usize {
+        const NVOS64_STATUS: usize = 40;
+        const NV_ERR_INVALID_CLASS: u32 = 0x22;
+        self.note_allow_refusal(format!("RM_ALLOC class {class:#06x}"), why);
+        let mut out = param_in.to_vec();
+        if out.len() < NVOS64_STATUS + 4 {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        }
+        out[NVOS64_STATUS..NVOS64_STATUS + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
+        self.write_ioctl_resp(resp_buf, cookie, &out)
+    }
+
+    /// Count a refusal, and say why the first time.
+    fn note_allow_refusal(&mut self, what: String, why: String) {
+        let n = self.allow_refused.entry(what.clone()).or_insert(0);
+        *n += 1;
+        if *n == 1 {
+            log::warn!("{what} refused: {why}");
+        }
     }
 
     /// Check one guest ioctl against the host's ABI profile.
@@ -339,6 +479,20 @@ impl NvidiaBackend {
                 if param_in.len() >= 12 {
                     let cmd = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
                     *self.rm_controls.entry(cmd).or_insert(0) += 1;
+                    // RM's own rule, applied on the guest's behalf. Both
+                    // numbers are checked: RM sizes the copy from NVOS54's
+                    // paramsSize at byte 24, so that has to be RM's size, and
+                    // the guest has to have actually sent that many bytes, or
+                    // RM reads past the end of what arrived.
+                    let declared = if param_in.len() >= 28 {
+                        u32::from_le_bytes(param_in[24..28].try_into().unwrap())
+                    } else {
+                        0
+                    };
+                    let sent = ireq.nested_len;
+                    if let Some(why) = self.rm_control_refusal(cmd, declared, sent) {
+                        return self.refuse_control(cookie, cmd, why, param_in, resp_buf);
+                    }
                 }
                 self.dispatch_nested(
                     cookie, host_fd, request, param_in, resp_buf, 32, 16, 24, deep_in, None,
@@ -357,6 +511,14 @@ impl NvidiaBackend {
                         if !self.caps.has(bit) {
                             return self.refuse_alloc_class(cookie, class, bit, param_in, resp_buf);
                         }
+                    }
+                    // The cap is a decision somebody made; this is RM's. Both
+                    // have to pass. The allocation parameters are the nested
+                    // block, the bytes `pAllocParms` addresses. `deep_in` is
+                    // one level further in: a pointer inside those parameters.
+                    let have = ireq.nested_len as usize;
+                    if let Some(why) = self.rm_class_refusal(class, have) {
+                        return self.refuse_alloc(cookie, class, why, param_in, resp_buf);
                     }
                 }
                 self.dispatch_nested(
