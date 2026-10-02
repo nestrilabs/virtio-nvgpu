@@ -424,9 +424,10 @@ impl NvGpuBackend {
                 } else {
                     let at = self.req.len();
                     self.req.resize(at + desc.len() as usize, 0);
-                    mem.read_slice(&mut self.req[at..], desc.addr()).map_err(|e| {
-                        std::io::Error::other(format!("read request descriptor: {e}"))
-                    })?;
+                    mem.read_slice(&mut self.req[at..], desc.addr())
+                        .map_err(|e| {
+                            std::io::Error::other(format!("read request descriptor: {e}"))
+                        })?;
                 }
             }
 
@@ -571,6 +572,34 @@ fn main() -> anyhow::Result<()> {
     // Before any device is opened: the host driver judges every guest call by
     // this process's credentials (device::posture).
     device::posture::enforce()?;
+
+    // The sandbox, before anything else: Landlock and seccomp cover this
+    // thread and every thread started after them, and `VhostUserDaemon::new`
+    // starts one. Everything the backend needs afterwards -- the GPU nodes,
+    // the driver's own trees, and the directory its socket is bound in -- is
+    // named here, because a ruleset cannot be added to once it is in force.
+    let socket_dir = Path::new(&args.socket)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let report = device::sandbox::enter(&device::sandbox::Paths {
+        devices: device::sandbox::gpu_nodes(),
+        read_only: vec![
+            args.proc_nvidia.clone(),
+            PathBuf::from("/sys/class/drm"),
+            PathBuf::from("/sys/bus/pci/devices"),
+            PathBuf::from("/sys/devices"),
+        ],
+        sockets: vec![socket_dir],
+    })?;
+    log::info!(
+        "sandbox: landlock ABI {}, {} seccomp instructions; no path outside the GPU nodes, the \
+         driver's own trees and the socket's directory, no executable mapping, no process, no \
+         socket but AF_UNIX",
+        report.landlock_abi,
+        report.seccomp_rules
+    );
 
     log::info!(
         "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}",
