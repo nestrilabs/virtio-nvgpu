@@ -160,6 +160,38 @@ host directly, so none of these numbers is a cost of virtualisation — they are
 what one streamed game uses on this card. Frame rate and frame pacing were not
 recorded.
 
+## One RM control
+
+The cost of a single forwarded call, which is what device setup, allocation
+and every driver query pay. `rmbench` (`scripts/rig/guest/rmbench.c`) times
+100,000 calls of `NV0000_CTRL_CMD_SYSTEM_GET_FEATURES`, which RM answers
+without touching the GPU. The same static binary runs in the guest and on the
+host.
+
+| build | A2000 guest | A2000 host | 3060 guest | 3060 host |
+|---|---:|---:|---:|---:|
+| v0.1.1 code (`--caps` added) | 35.5 us | 3.57 us | 18.1 us | 2.5 us |
+| per-call logging off, guarded buffers reused | 19.2 us | | | |
+| and request and response buffers kept | 19.3 us | | 13.6 us | |
+| and one completion per request in the guest | 19.3 us | | 13.5 us | |
+
+Median of three runs of 100,000 calls. A2000: driver 615.71.09, Arch, Linux
+7.2 guest, 2 vCPUs, nesbox. 3060: driver 595.104.02, Ubuntu 26.04, same guest
+kernel. 2026-10-02.
+
+The same call from several threads, `rmbench-mt`, A2000, total calls over
+wall time:
+
+| threads | before the guest fix | after |
+|---:|---|---:|
+| 1 | 20.3 us | 20.7 us |
+| 4 | 20,006 of 80,000 calls failed | 9.1 us |
+| 8 | 100,008 of 160,000 calls failed | 7.1 us |
+
+Before the fix the guest driver shared one completion between every caller,
+so concurrent calls woke the wrong thread or timed out. See the driver's
+`nvgpu_send_recv`.
+
 ## Re-taking these
 
 The harnesses are in the private engineering notes rather than here, because
