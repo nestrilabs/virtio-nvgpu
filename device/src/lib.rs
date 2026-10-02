@@ -9,6 +9,7 @@
 pub mod caps;
 pub mod error;
 pub mod guarded;
+pub mod guestmem;
 pub mod handle_table;
 pub mod host;
 pub mod mmap;
