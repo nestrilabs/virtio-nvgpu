@@ -85,7 +85,7 @@ sleep 1
 kill $BE 2>/dev/null || true
 wait $BE 2>/dev/null || true
 
-echo "== $PROBE ($RUN_TAG) on $(hostname), stamp $(cat "$(dirname "$0")/.stamp" 2>/dev/null || echo ?)"
+echo "== $PROBE ($RUN_TAG) on $(uname -n), stamp $(cat "$(dirname "$0")/.stamp" 2>/dev/null || echo ?)"
 grep -aE 'PASS|FAIL|frames=|deviceName|offscreen-draw|cuda|CUDA|panic|Oops' \
     "$GPU_LOGS/$RUN_TAG.console.log" | sed 's/^/  /' | head -n 30 || true
 grep -aE 'refus|served [0-9]+ message|panicked|error' "$GPU_LOGS/$RUN_TAG.backend.log" |

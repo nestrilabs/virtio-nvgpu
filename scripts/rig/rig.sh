@@ -12,6 +12,9 @@
 #                            guest kernel lives, put it on the GPU host
 #   rig.sh stage             put the module and probes into the test rootfs
 #   rig.sh probe P [P...]    boot one guest per probe, print what it said
+#   rig.sh nesbox            test and build the VMM at NESBOX_SRC on the build
+#                            host (static, forwarding only, no renderer) and
+#                            copy it to the GPU host as nesbox-$TAG
 #   rig.sh all P [P...]      sync, build, module, stage, probe
 #
 # RIG_TARGET picks scripts/rig/hosts-$RIG_TARGET.env (default box1). Those
@@ -63,7 +66,10 @@ retry() {
 }
 
 # remote HOST SCRIPT: run a bash script there.
-remote() { retry "${SSH[@]}" "$1" bash -s <<<"$2"; }
+# A non-interactive shell does not read the profile that puts rustup's cargo
+# on PATH, so it is added here for every host.
+remote() { retry "${SSH[@]}" "$1" bash -s <<<"export PATH=\$HOME/.cargo/bin:\$PATH
+$2"; }
 
 # The variables box-side scripts read, as one line of shell assignments.
 gpu_env() {
@@ -130,6 +136,42 @@ do_fmt() {
     git -C "$TOP" status --short -- '*.rs'
 }
 
+do_nesbox() {
+    # glibc, not musl: nesbox uses statx and ioctl constants musl's bindings
+    # lack. So it is built where its glibc is no newer than the GPU host's:
+    # NESBOX_ON=build on BUILD_HOST, NESBOX_ON=gpu on GPU_HOST.
+    local src=${NESBOX_SRC:?set NESBOX_SRC to a nesbox checkout} host dir i
+    if [ "${NESBOX_ON:-build}" = gpu ]; then
+        host=$GPU_HOST dir="$GPU_DIR-nesbox"
+    else
+        host=$BUILD_HOST dir="\$HOME/nesbox-rig"
+    fi
+    log "nesbox from $src on $host"
+    for i in $(seq 1 "$RIG_TRIES"); do
+        rsync -az --delete --exclude target/ --exclude .git/ --exclude '*.svg' --exclude 'perf.data*' \
+            -e "${SSH[*]}" "$src/" "$host:${dir#\$HOME/}/" && break
+        [ "$i" = "$RIG_TRIES" ] && return 255
+        sleep 5
+    done
+    remote "$host" "
+        set -euo pipefail
+        cd $dir
+        rc=0; cargo test -p virtio-devices --no-default-features --quiet nvgpu > out-test.log 2>&1 || rc=\$?
+        grep -E '^test result|FAILED|panicked|^error' out-test.log || true
+        [ \$rc = 0 ] || { tail -n 40 out-test.log; exit 1; }
+        cargo build --release --no-default-features -p nesbox-vmm --bin nesbox --quiet > out-build.log 2>&1 \\
+            || { grep -E '^error' -A12 out-build.log | head -n 60; exit 1; }
+        strip -o nesbox target/release/nesbox
+        ls -l nesbox
+    "
+    if [ "${NESBOX_ON:-build}" = gpu ]; then
+        remote "$GPU_HOST" "install -m 755 $dir/nesbox $GPU_BIN/nesbox-$TAG"
+    else
+        retry scp -3 -q "$BUILD_HOST:nesbox-rig/nesbox" "$GPU_HOST:$GPU_BIN/nesbox-$TAG"
+    fi
+    log "nesbox -> $GPU_HOST:$GPU_BIN/nesbox-$TAG"
+}
+
 do_build() {
     log "build on $BUILD_HOST"
     remote "$BUILD_HOST" "
@@ -139,7 +181,8 @@ do_build() {
         rc=0; cargo test --workspace --quiet > out-test.log 2>&1 || rc=\$?
         grep -E '^test result|FAILED|panicked|^error' out-test.log || true
         [ \$rc = 0 ] || { echo \"cargo test failed (\$rc); see ~/$BUILD_DIR/out-test.log\" >&2; exit 1; }
-        cargo build --release --target $MUSL --features vhost-user -p device --bins --quiet
+        cargo build --release --target $MUSL --features vhost-user -p device --bins --quiet > out-build.log 2>&1 \\
+            || { grep -E '^error' -A12 out-build.log | head -n 60; exit 1; }
         mkdir -p out
         for b in vhost-user-nvgpu nvgpu-userspace; do
             cp target/$MUSL/release/\$b out/\$b
@@ -197,6 +240,7 @@ cmd=${1:-}
 shift || true
 case "$cmd" in
 check) do_check ;;
+nesbox) do_nesbox ;;
 fmt) do_fmt ;;
 sync) do_sync ;;
 build) do_build ;;
