@@ -2145,6 +2145,12 @@ mod tests {
         fn nums(&self) -> Vec<u64> {
             self.calls().into_iter().map(|(n, _)| n).collect()
         }
+        /// The four bytes at `at` of the last block the host was given.
+        fn last_param(&self, at: usize) -> u32 {
+            let calls = self.calls();
+            let (_, p) = calls.last().expect("the host was called");
+            u32::from_le_bytes(p[at..at + 4].try_into().unwrap())
+        }
         /// The VA space reports pageable access on, as it would on a host with
         /// HMM or ATS available and a release with no flag to refuse it.
         fn pageable_is_on(&self) {
@@ -2397,13 +2403,37 @@ mod tests {
     fn a_descriptor_this_vm_never_opened_is_refused() {
         let host = UvmHost::default();
         let (mut be, uvm, _) = uvm_backend(&host, v615());
-        for raw in [-1i32, 0, 4096] {
+        for raw in [-2i32, 0, 4096] {
             let mut p = vec![0u8; 40];
             p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&raw.to_le_bytes());
             let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &p);
             assert_ne!(parse_resp(&resp).status, 0, "descriptor {raw}");
         }
         assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    /// -1 is "none", and goes through as itself.
+    ///
+    /// UVM never resolves this field -- every consumer is a `(void)` beside
+    /// "TODO: Bug 1624521: This interface needs to use rm_control_fd to do
+    /// validation" -- and passes -1 itself for its own internal lookups. CUDA
+    /// sends -1 to UVM_REGISTER_GPU on a GPU with no SMC partition, and
+    /// refusing it stopped `cuInit` before anything else could be asked.
+    #[test]
+    fn a_descriptor_of_minus_one_is_none_and_goes_through() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        let mut p = vec![0u8; 40];
+        p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&(-1i32).to_le_bytes());
+
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &p);
+        assert_eq!(parse_resp(&resp).status, 0, "the call is served");
+        assert_eq!(host.calls().len(), 1, "the host heard it once");
+        assert_eq!(
+            host.last_param(REGISTER_GPU_FD),
+            (-1i32) as u32,
+            "and it arrived as -1, not as one of this backend's descriptors"
+        );
     }
 
     /// There is no dma-buf this backend handed out, so the number can only

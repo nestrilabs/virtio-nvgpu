@@ -174,9 +174,29 @@ impl NvidiaBackend {
             );
         }
 
-        // UVM resolves the descriptor in every call that carries one -- all
-        // four uses reach `uvm_rm_user_object_t` -- so there is no spelling of
-        // "none" to pass through, unlike RM's -1.
+        // -1 is "none", and has to go through as -1.
+        //
+        // An earlier reading of this said UVM resolves the descriptor in every
+        // call that carries one, so there was no "none" to pass through. That
+        // is not what the code does: every consumer of `rm_control_fd` is a
+        // `(void)` beside "TODO: Bug 1624521: This interface needs to use
+        // rm_control_fd to do validation" (`uvm_va_space.c`,
+        // `uvm_user_channel.c`), and UVM itself passes -1 for its own internal
+        // lookups. CUDA passes -1 to UVM_REGISTER_GPU on a GPU with no SMC
+        // partition, and refusing it stopped `cuInit` outright.
+        //
+        // Nothing is given away by forwarding it: -1 names no file in any
+        // process. Any other negative number is still refused, because it is
+        // neither "none" nor anything this backend could translate.
+        //
+        // The client check below cannot apply here, because it asks which file
+        // a client was made on and there is no file. What it would have ruled
+        // out -- a client this VM was never given -- is already ruled out by
+        // RM: clients resolve per process, this process serves one guest, and
+        // every client in it is that guest's.
+        if raw == -1 {
+            return Ok(-1);
+        }
         if raw < 0 {
             return Err(format!(
                 "it needs a descriptor at byte {} and was sent {raw}",
