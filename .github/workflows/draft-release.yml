@@ -84,9 +84,9 @@ jobs:
           # Released already: the PR that makes the next release has not
           # bumped it yet. Say so at the top rather than guess a number.
           if gh api "repos/$REPO/releases/tags/$next" >/dev/null 2>&1; then
-            heading="**$next is already released: bump the version in $VERSION_FROM before publishing.**
-
-$heading"
+            heading=$(printf '%s\n\n%s' \
+              "**$next is already released: bump the version in $VERSION_FROM before publishing.**" \
+              "$heading")
           fi
 
           body=$(printf '%s\n%s\n\n%s\n\n%s\n' "$top" "$marker" "$heading" "$commits")
