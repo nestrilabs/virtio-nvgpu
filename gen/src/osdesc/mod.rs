@@ -117,6 +117,11 @@ pub struct OsDesc {
     /// here, which is what RM itself does for a function it does not serve
     /// (`rmapi_deprecated_vidheapctrl.c`: `pArgs->status = status`).
     pub vid_heap_status_at: usize,
+    /// Byte offset of `data.AllocOsDesc.hMemory` in `NVOS32_PARAMETERS`: the
+    /// handle RM gives the registration back under, which is what a later
+    /// free names it by. The other two routes carry theirs as `hObjectNew` in
+    /// the flat struct, at a place the guest driver already knows.
+    pub vid_heap_hmemory_at: usize,
     pub types: &'static [DescType],
 }
 

@@ -34,6 +34,7 @@ pub static OSDESC: OsDesc = OsDesc {
     },
     vid_heap_function_at: 8,
     vid_heap_status_at: 20,
+    vid_heap_hmemory_at: 40,
     types: &[
         DescType::new(0, "NVOS32_DESCRIPTOR_TYPE_VIRTUAL_ADDRESS"),
         DescType::new(1, "NVOS32_DESCRIPTOR_TYPE_OS_PAGE_ARRAY"),

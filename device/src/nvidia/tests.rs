@@ -1628,6 +1628,51 @@ mod tests {
         assert_eq!(host.calls().len(), 1, "host heard {:x?}", host.calls());
     }
 
+    /// What the guest is told about registration by address. It cannot work
+    /// any of it out: the three routes keep the address in three different
+    /// places, and only the host release says where.
+    #[test]
+    fn the_guest_is_told_where_each_route_keeps_its_address() {
+        let host = CountingHost::default();
+        let (be, _h) = backend_on(&host);
+        let d = osdesc();
+        let mut buf = vec![0u8; 1024];
+        let n = be.write_osdesc_section(&mut buf);
+        assert_eq!(n, 22 * 4, "the section is a fixed set of words");
+
+        let word = |i: usize| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(word(0), NvidiaBackend::OSDESC_MAGIC);
+        assert_eq!(word(1), d.class);
+        assert_eq!(word(2), d.vid_heap_function);
+        assert_eq!(word(3), d.vid_heap_function_at as u32);
+        assert_eq!(word(4), d.alloc_memory_class_at as u32);
+        assert_eq!(word(5), d.virtual_address);
+        assert_eq!(word(6), d.alloc_memory_status_at as u32);
+        assert_eq!(word(7), d.vid_heap_status_at as u32);
+        assert_eq!(word(8), d.vid_heap_hmemory_at as u32);
+
+        for (i, r) in [d.alloc, d.alloc_memory, d.vid_heap].iter().enumerate() {
+            let at = 10 + i * 4;
+            assert_eq!(word(at), r.params_size as u32, "route {i} size");
+            assert_eq!(word(at + 1), r.address_at as u32, "route {i} address");
+            assert_eq!(word(at + 2), r.limit_at as u32, "route {i} limit");
+            assert_eq!(word(at + 3), r.type_at as u32, "route {i} type");
+            // Whatever the release says, the address has to be inside the
+            // block, or the guest reads past what its own caller sent.
+            assert!(r.address_at + 8 <= r.params_size, "route {i}");
+        }
+    }
+
+    /// With no release there is nothing to say, and a guest told nothing sends
+    /// no pages -- which is refused, the same answer as before any of this.
+    #[test]
+    fn a_backend_with_no_release_describes_no_route() {
+        let be = NvidiaBackend::for_test();
+        let mut buf = vec![0u8; 1024];
+        assert_eq!(be.write_osdesc_section(&mut buf), 0);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
     // ==================================================================
     // UVM
     // ==================================================================

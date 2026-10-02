@@ -81,6 +81,7 @@ int main(void) {
   P("vid_heap_limit_at", offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.limit));
   P("vid_heap_type_at", offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.descriptorType));
   P("vid_heap_status_at", offsetof(NVOS32_PARAMETERS, status));
+  P("vid_heap_hmemory_at", offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.hMemory));
   return 0;
 }
 """
@@ -142,6 +143,7 @@ def emit(v, cls, function, types, version, stream):
     w("    },\n")
     w("    vid_heap_function_at: %d,\n" % v["vid_heap_function_at"])
     w("    vid_heap_status_at: %d,\n" % v["vid_heap_status_at"])
+    w("    vid_heap_hmemory_at: %d,\n" % v["vid_heap_hmemory_at"])
     w("    types: &[\n")
     for name, val in sorted(types.items(), key=lambda kv: kv[1]):
         w('        DescType::new(%d, "NVOS32_DESCRIPTOR_TYPE_%s"),\n' % (val, name))

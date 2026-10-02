@@ -198,6 +198,7 @@ impl NvidiaBackend {
             off += self.write_dri_section(&mut resp_buf[off..]);
             off += self.write_alloc_size_section(&mut resp_buf[off..]);
             off += self.write_uvm_section(&mut resp_buf[off..]);
+            off += self.write_osdesc_section(&mut resp_buf[off..]);
         }
         off
     }
@@ -336,6 +337,74 @@ impl NvidiaBackend {
             "GET_SYS_FILES: {} UVM command(s), {} carrying a descriptor",
             rows.len(),
             rows.iter().filter(|r| r[2] != Self::UVM_FD_NONE).count()
+        );
+        off
+    }
+
+    /// Magic word opening the OS-descriptor section.
+    pub(super) const OSDESC_MAGIC: u32 = 0x4e564f44; // "NVOD"
+
+    /// Where the host release keeps the CPU address on each route that names
+    /// memory by one.
+    ///
+    /// The guest driver needs these for the half only it can do: a registered
+    /// address is an address in the *calling process*, and the pages behind it
+    /// can only be found and pinned on that side. To do that it has to
+    /// recognise the call and find the address in it, and both are the host
+    /// release's business, not something to compile in -- which is the lesson
+    /// the allocation sizes taught in M4.
+    ///
+    /// Sent whether or not registration is served. A guest told nothing here
+    /// sends no pages, and a registration with no pages is refused, which is
+    /// the same answer as before this existed.
+    pub(super) fn write_osdesc_section(&self, buf: &mut [u8]) -> usize {
+        let Some(d) = self.osdesc else {
+            return 0;
+        };
+        // magic, class, vid_heap_function, vid_heap_function_at,
+        // alloc_memory_class_at, virtual_address, then four words per route.
+        let words: [u32; 22] = [
+            Self::OSDESC_MAGIC,
+            d.class,
+            d.vid_heap_function,
+            d.vid_heap_function_at as u32,
+            d.alloc_memory_class_at as u32,
+            d.virtual_address,
+            // Where each route reports what it did: the status RM writes, and
+            // for the heap route the handle the registration comes back
+            // under. The other two carry theirs as `hObjectNew` at a place the
+            // guest driver already knows, in a struct it already has.
+            d.alloc_memory_status_at as u32,
+            d.vid_heap_status_at as u32,
+            d.vid_heap_hmemory_at as u32,
+            0, // reserved, so the routes below stay on a round offset
+            d.alloc.params_size as u32,
+            d.alloc.address_at as u32,
+            d.alloc.limit_at as u32,
+            d.alloc.type_at as u32,
+            d.alloc_memory.params_size as u32,
+            d.alloc_memory.address_at as u32,
+            d.alloc_memory.limit_at as u32,
+            // `usize::MAX` means the route has no descriptor type; narrowed to
+            // u32 it is still a value no offset can be.
+            d.alloc_memory.type_at as u32,
+            d.vid_heap.params_size as u32,
+            d.vid_heap.address_at as u32,
+            d.vid_heap.limit_at as u32,
+            d.vid_heap.type_at as u32,
+        ];
+        if buf.len() < words.len() * 4 {
+            log::warn!("no room for the OS-descriptor section; the guest will register nothing");
+            return 0;
+        }
+        let mut off = 0;
+        for w in words {
+            buf[off..off + 4].copy_from_slice(&w.to_le_bytes());
+            off += 4;
+        }
+        log::info!(
+            "GET_SYS_FILES: memory may be registered by address on 3 routes, class {:#06x}",
+            d.class
         );
         off
     }
