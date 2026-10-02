@@ -4,8 +4,8 @@
 //
 // Ported from gVisor's pkg/abi/nvgpu/ (Apache-2.0).
 
+pub mod fixtures;
 pub mod ioctl;
 pub mod types;
 pub mod version;
 pub mod versions;
-pub mod fixtures;
