@@ -148,6 +148,15 @@ struct nvgpu_open_resp {
 #define NVGPU_DEEP_SEGMENTED 0xffffffffu
 
 /*
+ * The backend understands a segmented deep block. Without it, a parameter
+ * block's pointers are carried the v0.1 way, one per call: a v0.1 backend
+ * reads deep_ptr_offset as a real offset, and NVGPU_DEEP_SEGMENTED as an
+ * offset is 4294967295 bytes into a 16-byte block, which it refuses -- taking
+ * every described control with it.
+ */
+#define NVGPU_FEATURE_RMCTRL_SEGMENTS (1u << 0)
+
+/*
  * The largest nvidia-drm GEM parameter struct this driver forwards, and the
  * largest NVKMS block one of them may point at. The first is a stack buffer's
  * size, so it is small on purpose and BUILD_BUG_ON'd against the descriptors
@@ -254,7 +263,12 @@ struct virtio_gpu_nv_config {
   __le32 gpu_device_ids[8];              /* 40.. 72 */
   struct virtio_gpu_nv_gpu_slot gpus[8]; /* 72..    */
   __le32 num_fd_translations;
-  __le32 _pad;
+  /*
+   * What the backend can do beyond v0.1, as NVGPU_FEATURE_* bits. This field
+   * was padding, and a backend from before it sends zero -- which is exactly
+   * "none of these", so no version is needed to read it.
+   */
+  __le32 features;
   struct nvgpu_fd_translation_entry fd_translations[16];
 } __packed;
 
@@ -382,9 +396,11 @@ MODULE_PARM_DESC(poll_events, "a wait on a device descriptor really waits");
  * Microseconds a caller spins on the control queue for its answer before
  * sleeping. An answer that comes back inside the spin skips the interrupt's
  * wake-up and the scheduler, which is most of a forwarded call's cost when
- * the host answers in a few microseconds. 0, the default, never spins.
+ * the host answers in a few microseconds. Measured on an RTX 3060, answers
+ * land within 5 us, so 10 catches them and costs a slow call at most that
+ * much CPU before it sleeps as before. 0 never spins.
  */
-static int nvgpu_rpc_spin_us;
+static int nvgpu_rpc_spin_us = 10;
 module_param_named(rpc_spin_us, nvgpu_rpc_spin_us, int, 0644);
 MODULE_PARM_DESC(rpc_spin_us, "microseconds to spin for a control-queue answer before sleeping");
 
@@ -529,6 +545,8 @@ struct nvgpu_device {
 
   /* FD translation table received from backend */
   struct nvgpu_fd_translation_entry fd_translations[16];
+  /* NVGPU_FEATURE_* the backend published. Zero from a v0.1 backend. */
+  u32 features;
   u32 num_fd_translations;
 
   /* Every open descriptor, so an event naming a handle can find its file. */
@@ -1620,7 +1638,8 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
         nvgpu_rmctrl_find(nfd->dev->rmctrl, ctl_cmd);
     int i = 0;
 
-    if (ent && !ent->refuse && user_nested && nested_size >= ent->params_size &&
+    if ((nfd->dev->features & NVGPU_FEATURE_RMCTRL_SEGMENTS) && ent &&
+        !ent->refuse && user_nested && nested_size >= ent->params_size &&
         ent->ptr_count > 0 && ent->ptr_count <= NVGPU_RMCTRL_MAX_SEGMENTS) {
       void *pbuf = kmalloc(nested_size, GFP_KERNEL);
       u32 total = 8 + 8 * (u32)ent->ptr_count;
@@ -4668,6 +4687,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   }
 
   /* FD translation table */
+  virtio_cread(vdev, struct virtio_gpu_nv_config, features, &dev->features);
   virtio_cread(vdev, struct virtio_gpu_nv_config, num_fd_translations,
                &dev->num_fd_translations);
 
