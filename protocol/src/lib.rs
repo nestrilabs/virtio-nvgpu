@@ -16,6 +16,7 @@
 #![no_std]
 
 pub mod messages;
+pub mod pageruns;
 pub mod segments;
 
 pub use messages::*;
