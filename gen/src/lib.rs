@@ -9,6 +9,7 @@ pub mod ioctl;
 pub mod rmallow;
 pub mod rmctrl;
 pub mod types;
+pub mod uvm;
 pub mod version;
 pub mod versions;
 pub mod vidmem;
