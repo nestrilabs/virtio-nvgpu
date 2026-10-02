@@ -85,6 +85,15 @@ extern struct kset *module_kset;
 /* "NVAL": opens the allocation-size section of a GET_SYS_FILES response. */
 #define NVGPU_ALLOC_SIZE_MAGIC 0x4e56414cu
 
+/* "NVUV": opens the UVM command section of the same response. */
+#define NVGPU_UVM_CMD_MAGIC 0x4e565556u
+
+/* Which file a descriptor inside a UVM parameter block has to name. */
+#define NVGPU_UVM_FD_NONE 0
+#define NVGPU_UVM_FD_CTL 1
+#define NVGPU_UVM_FD_UVM 2
+#define NVGPU_UVM_FD_FOREIGN 3
+
 /* device_type values for OPEN */
 #define NVGPU_DEV_CTL 255
 #define NVGPU_DEV_UVM 256
@@ -252,6 +261,14 @@ struct virtio_gpu_nv_gpu_slot {
   __le32 padding[1];    /*   24.. 28                          */
   char info_text[448];  /*   28.. 476 raw information content  */
 } __packed;             /* 476 bytes */
+
+/* One UVM call, as the backend read it out of the host's release. */
+struct nvgpu_uvm_cmd {
+  u32 num;         /* the whole ioctl number, not _IOC_NR */
+  u32 params_size; /* sizeof the parameter struct */
+  u32 fd_kind;     /* NVGPU_UVM_FD_*: which file the descriptor names */
+  u32 fd_at;       /* byte offset of that descriptor */
+};
 
 struct nvgpu_fd_translation_entry {
   __le32 nr;
@@ -574,6 +591,20 @@ struct nvgpu_device {
     u32 params_size;
   } alloc_sizes[NVGPU_MAX_ALLOC_SIZES];
   int num_alloc_sizes;
+
+  /*
+   * The UVM calls the host release takes: the whole ioctl number, the size of
+   * its parameter block, and where a descriptor sits in it.
+   *
+   * Neither size nor offset can be had from the ioctl number here. UVM puts
+   * 0x3000 in the size field of every one of them -- an upper bound, not a
+   * struct -- and _IOC_NR cannot tell UVM_INITIALIZE (0x30000001) from
+   * UVM_RESERVE_VA (1). Empty until GET_SYS_FILES answers, and a UVM call
+   * that is not here is refused rather than forwarded at a guessed size.
+   */
+#define NVGPU_MAX_UVM_CMDS 128
+  struct nvgpu_uvm_cmd uvm_cmds[NVGPU_MAX_UVM_CMDS];
+  int num_uvm_cmds;
 
   /* ── PCI sysfs fake hierarchy ── */
   struct kobject *pci_bus_kobj;     /* /sys/bus/pci              */
@@ -2256,58 +2287,50 @@ static long nvgpu_ioctl(struct file *filp, unsigned int cmd,
   return nvgpu_ioctl_fd(filp->private_data, cmd, arg);
 }
 
+/*
+ * The UVM calls the host release takes, found by the whole ioctl number.
+ *
+ * Not by _IOC_NR: UVM_INITIALIZE is 0x30000001 and UVM_RESERVE_VA is 1, and
+ * they agree in every byte an ioctl type or number is read from. This module
+ * used to switch on _IOC_NR and gave both the former's size.
+ */
+static const struct nvgpu_uvm_cmd *
+nvgpu_find_uvm_cmd(struct nvgpu_device *dev, unsigned int cmd) {
+  int i;
+  for (i = 0; i < dev->num_uvm_cmds; i++)
+    if (dev->uvm_cmds[i].num == cmd)
+      return &dev->uvm_cmds[i];
+  return NULL;
+}
+
 static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
                             unsigned long arg) {
   struct nvgpu_fd *nfd = filp->private_data;
-  unsigned int nr = _IOC_NR(cmd);
-  unsigned int sz = _IOC_SIZE(cmd);
   void __user *uarg = (void __user *)arg;
+  const struct nvgpu_uvm_cmd *uc;
+  unsigned int sz;
 
   /*
-   * UVM ioctls use _IOC(0, 0, nr, 0x3000) — type=0, size=0x3000.
-   * _IOC_SIZE() returns 0x3000 which is the max buffer, not the
-   * actual struct size. Use the real struct sizes instead.
-   *
-   * UVM_INITIALIZE     (nr=1):  flags:u64 + rmStatus:u32 + pad = 16 bytes
-   * UVM_DEINITIALIZE   (nr=2):  no parameters; UVM returns 0    =  0 bytes
-   * UVM_MM_INITIALIZE  (nr=75): uvmFd:s32 + rmStatus:u32        =  8 bytes
-   *
-   * (nvidia-uvm/uvm_linux_ioctl.h and uvm_ioctl.h; UVM_IOCTL_BASE(i) is i
-   * on Linux.)
-   *
-   * For all other UVM ioctls we use 0x3000 as an upper bound since
-   * we don't know their sizes — the host driver will only read what
-   * it needs.
+   * _IOC_SIZE on a UVM ioctl is 0x3000, which is the buffer UVM is willing to
+   * read and not the size of anything. The real sizes come from the backend,
+   * which reads them out of the release the host is running; without them
+   * there is nothing to copy but a guess, and a guess here is a struct read
+   * short or a buffer read long.
    */
-  if (sz == 0 || sz == 0x3000) {
-    switch (nr) {
-    case 1:
-      sz = 16;
-      break; /* UVM_INITIALIZE        */
-    case 2:
-      sz = 0;
-      break; /* UVM_DEINITIALIZE      */
-    case 75:
-      sz = 8;
-      break; /* UVM_MM_INITIALIZE     */
-    default:
-      sz = 0x3000;
-      break;
-    }
+  uc = nvgpu_find_uvm_cmd(nfd->dev, cmd);
+  if (!uc) {
+    dev_dbg(&nfd->dev->vdev->dev,
+            "virtio-gpu-nv: UVM 0x%x is not one the host release takes\n", cmd);
+    return -ENOTTY;
   }
-
-  if (sz > 0x3000)
-    return -EINVAL;
+  sz = uc->params_size;
 
   /*
-   * A call with no argument (UVM_DEINITIALIZE is made that way) is
-   * forwarded with a zeroed buffer of the size above.
+   * A call with no argument -- UVM_DEINITIALIZE is made that way -- is
+   * forwarded with a zeroed buffer, because copy_from_user cannot be given a
+   * NULL pointer and the host still has an rmStatus to write.
    */
   if (arg == 0) {
-    /*
-     * Can't copy_from_user a NULL pointer. Build a zeroed buffer
-     * and send it; the host UVM driver will populate rmStatus.
-     */
     int req_total = sizeof(struct nvgpu_ioctl_req) + sz;
     int resp_max = sizeof(struct nvgpu_ioctl_resp) + sz;
     void *req_buf, *resp_buf;
@@ -2344,14 +2367,25 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
   }
 
   /*
+   * A descriptor inside the parameters is a number in *this* process's table
+   * and nothing in the backend's, so it is resolved here to the handle the
+   * backend knows the file by. Which byte it sits at is the host release's
+   * business and arrives with the table; the backend checks that what comes
+   * back is a file this VM opened, and of the kind the call wants.
+   *
+   * A foreign descriptor -- UVM_IMPORT_DMA_BUF names one -- is not ours to
+   * resolve, so it goes as it stands and the backend refuses it.
+   */
+  if (uc->fd_kind == NVGPU_UVM_FD_CTL || uc->fd_kind == NVGPU_UVM_FD_UVM)
+    return nvgpu_ioctl_translate_fd(nfd, cmd, uarg, sz, uc->fd_at);
+
+  /*
    * UVM_INITIALIZE's flags are the backend's to decide: it sends the host
    * MULTI_PROCESS_SHARING_MODE with HMM and pageable access off, whatever is
-   * asked here (device/src/nvidia.rs, uvm_init_flags). This side used to OR
-   * in bit 2 for sharing mode, which is DISABLE_PAGEABLE_ACCESS on 610.43.02
-   * and later and unknown, so refused, before; and it wrote the result back
-   * into the caller's buffer.
+   * asked here, because every guest process's UVM file is opened over there.
+   * This side used to OR in bit 2 for sharing mode, which is
+   * DISABLE_PAGEABLE_ACCESS on 615.71.09 and unknown, so refused, before it.
    */
-
   return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
 }
 
@@ -4503,12 +4537,15 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     count = le32_to_cpu(raw);
     p += 8;
 
-    if (count > NVGPU_MAX_ALLOC_SIZES) {
+    /*
+     * More than this module can hold is not a reason to stop reading: p has
+     * to end up past every record either way, because another section follows
+     * and a section read at the wrong offset reads noise.
+     */
+    if (count > NVGPU_MAX_ALLOC_SIZES)
       dev_warn(&dev->vdev->dev,
                "virtio-gpu-nv: backend sent %u allocation sizes, keeping %u\n",
                count, (u32)NVGPU_MAX_ALLOC_SIZES);
-      count = NVGPU_MAX_ALLOC_SIZES;
-    }
 
     dev->num_alloc_sizes = 0;
     for (i = 0; i < count; i++) {
@@ -4517,16 +4554,93 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
                  "virtio-gpu-nv: allocation sizes truncated at entry %u\n", i);
         break;
       }
-      memcpy(&raw, p, sizeof(__le32));
-      dev->alloc_sizes[i].class_id = le32_to_cpu(raw);
-      memcpy(&raw, p + 4, sizeof(__le32));
-      dev->alloc_sizes[i].params_size = le32_to_cpu(raw);
+      if (dev->num_alloc_sizes < NVGPU_MAX_ALLOC_SIZES) {
+        memcpy(&raw, p, sizeof(__le32));
+        dev->alloc_sizes[dev->num_alloc_sizes].class_id = le32_to_cpu(raw);
+        memcpy(&raw, p + 4, sizeof(__le32));
+        dev->alloc_sizes[dev->num_alloc_sizes].params_size = le32_to_cpu(raw);
+        dev->num_alloc_sizes++;
+      }
       p += 8;
-      dev->num_alloc_sizes++;
     }
     dev_info(&dev->vdev->dev,
              "virtio-gpu-nv: the host's RM sizes %d allocation class(es)\n",
              dev->num_alloc_sizes);
+  }
+
+  /* ── Section 4: the UVM calls the host release takes ─────────── */
+  /*
+   * Magic-guarded for the same reason as section 3, and read even when
+   * section 3 was absent -- the magic says which section this is, so a
+   * backend that sends one and not the other is read correctly either way.
+   */
+  {
+    __le32 raw;
+    u32 magic, count, i;
+
+    if (p + 8 > end)
+      goto out;
+
+    memcpy(&raw, p, sizeof(__le32));
+    magic = le32_to_cpu(raw);
+    if (magic != NVGPU_UVM_CMD_MAGIC) {
+      dev_info(&dev->vdev->dev,
+               "virtio-gpu-nv: backend sent no UVM command table; UVM calls "
+               "will be refused\n");
+      goto out;
+    }
+    memcpy(&raw, p + 4, sizeof(__le32));
+    count = le32_to_cpu(raw);
+    p += 8;
+
+    if (count > NVGPU_MAX_UVM_CMDS)
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: backend sent %u UVM commands, keeping %u; the "
+               "rest will be refused\n",
+               count, (u32)NVGPU_MAX_UVM_CMDS);
+
+    dev->num_uvm_cmds = 0;
+    for (i = 0; i < count; i++) {
+      struct nvgpu_uvm_cmd *uc;
+
+      if (p + 16 > end) {
+        dev_warn(&dev->vdev->dev,
+                 "virtio-gpu-nv: UVM commands truncated at entry %u\n", i);
+        break;
+      }
+      if (dev->num_uvm_cmds < NVGPU_MAX_UVM_CMDS) {
+        uc = &dev->uvm_cmds[dev->num_uvm_cmds];
+        memcpy(&raw, p, sizeof(__le32));
+        uc->num = le32_to_cpu(raw);
+        memcpy(&raw, p + 4, sizeof(__le32));
+        uc->params_size = le32_to_cpu(raw);
+        memcpy(&raw, p + 8, sizeof(__le32));
+        uc->fd_kind = le32_to_cpu(raw);
+        memcpy(&raw, p + 12, sizeof(__le32));
+        uc->fd_at = le32_to_cpu(raw);
+
+        /*
+         * A descriptor the record places outside the block it belongs to
+         * would have this module patch past the end of its own buffer. The
+         * backend is not the thing being defended against here; a wrong
+         * answer from anywhere is.
+         */
+        if (uc->fd_kind != NVGPU_UVM_FD_NONE &&
+            (u64)uc->fd_at + 4 > (u64)uc->params_size) {
+          dev_warn(&dev->vdev->dev,
+                   "virtio-gpu-nv: UVM 0x%x puts a descriptor at %u of %u "
+                   "bytes; refusing the call\n",
+                   uc->num, uc->fd_at, uc->params_size);
+          p += 16;
+          continue;
+        }
+        dev->num_uvm_cmds++;
+      }
+      p += 16;
+    }
+    dev_info(&dev->vdev->dev,
+             "virtio-gpu-nv: the host release takes %d UVM call(s)\n",
+             dev->num_uvm_cmds);
   }
 
 out:

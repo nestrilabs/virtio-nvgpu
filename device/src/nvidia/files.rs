@@ -197,6 +197,7 @@ impl NvidiaBackend {
         if tree == FileTree::Sys {
             off += self.write_dri_section(&mut resp_buf[off..]);
             off += self.write_alloc_size_section(&mut resp_buf[off..]);
+            off += self.write_uvm_section(&mut resp_buf[off..]);
         }
         off
     }
@@ -250,6 +251,91 @@ impl NvidiaBackend {
         log::info!(
             "GET_SYS_FILES: RM's allocation sizes for {} class(es)",
             with_params.len()
+        );
+        off
+    }
+
+    /// Magic word opening the UVM section, and what each record means.
+    ///
+    /// `kind` is which file the descriptor at `at` has to be: nothing, this
+    /// VM's `/dev/nvidiactl`, its `/dev/nvidia-uvm`, or a file this backend
+    /// never opened.
+    pub(super) const UVM_CMD_MAGIC: u32 = 0x4e56_5556; // "NVUV"
+    const UVM_FD_NONE: u32 = 0;
+    const UVM_FD_CTL: u32 = 1;
+    const UVM_FD_UVM: u32 = 2;
+    const UVM_FD_FOREIGN: u32 = 3;
+
+    /// The UVM commands the host release takes, their sizes, and where a
+    /// descriptor sits in each.
+    ///
+    /// The guest driver cannot get either from the ioctl number. UVM encodes
+    /// `0x3000` as the size for every call -- an upper bound, not a struct --
+    /// so the guest had been forwarding 12288 bytes for commands whose
+    /// parameters are twenty, and had a hand-written list of three exceptions
+    /// that got the rest wrong. Worse, `_IOC_NR` cannot tell UVM_INITIALIZE
+    /// (`0x30000001`) from UVM_RESERVE_VA (`1`): they share a low byte, and
+    /// the module's switch gave both the former's size.
+    ///
+    /// The descriptors are the other half. A `rmCtrlFd` inside a parameter
+    /// block is a number in the *calling process's* table, and the guest
+    /// driver is the only side that can resolve it to the file it names.
+    /// Which byte to look at is the host release's business, so it comes from
+    /// here, and the backend checks what comes back.
+    pub(super) fn write_uvm_section(&self, buf: &mut [u8]) -> usize {
+        let Some(sel) = self.uvm else {
+            // No release known, so nothing to say. The guest refuses every UVM
+            // call rather than guessing, which is what the backend does too.
+            return 0;
+        };
+        const REC: usize = 16;
+        let mut rows = Vec::new();
+        for c in sel.cmd {
+            // One descriptor is all the record has room for. No release here
+            // has a command with two, and `a_uvm_command_carries_at_most_one`
+            // in `abi::uvm` is what says so; a release that broke it would
+            // have its command left out, and left out means refused.
+            let (kind, at) = match c.fds {
+                [] => (Self::UVM_FD_NONE, 0),
+                [one] => (
+                    match one.kind {
+                        abi::uvm::Fd::Ctl => Self::UVM_FD_CTL,
+                        abi::uvm::Fd::Uvm => Self::UVM_FD_UVM,
+                        abi::uvm::Fd::Foreign => Self::UVM_FD_FOREIGN,
+                    },
+                    one.at as u32,
+                ),
+                more => {
+                    log::warn!(
+                        "UVM {:#x} carries {} descriptors and the guest is told of one at most;                          leaving it out, which refuses it",
+                        c.num,
+                        more.len()
+                    );
+                    continue;
+                }
+            };
+            rows.push([c.num, c.params_size, kind, at]);
+        }
+
+        if buf.len() < 8 + rows.len() * REC {
+            log::warn!("no room for the UVM section; the guest will serve no UVM call");
+            return 0;
+        }
+        let mut off = 0;
+        for v in [Self::UVM_CMD_MAGIC, rows.len() as u32] {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            off += 4;
+        }
+        for r in &rows {
+            for v in r {
+                buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                off += 4;
+            }
+        }
+        log::info!(
+            "GET_SYS_FILES: {} UVM command(s), {} carrying a descriptor",
+            rows.len(),
+            rows.iter().filter(|r| r[2] != Self::UVM_FD_NONE).count()
         );
         off
     }

@@ -1697,6 +1697,63 @@ mod tests {
         assert_eq!(host.nums().len(), before, "host heard {:x?}", host.nums());
     }
 
+    /// What the guest is told about UVM. It cannot work any of this out: UVM
+    /// puts 0x3000 in the size field of every call, and `_IOC_NR` cannot tell
+    /// UVM_INITIALIZE from UVM_RESERVE_VA.
+    #[test]
+    fn the_guest_is_told_the_shape_of_every_uvm_call() {
+        let host = UvmHost::default();
+        let (be, _, _) = uvm_backend(&host, v615());
+        let mut buf = vec![0u8; 8192];
+        let n = be.write_uvm_section(&mut buf);
+        assert!(n >= 8, "the section was not written");
+
+        let word = |i: usize| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(word(0), NvidiaBackend::UVM_CMD_MAGIC);
+        let count = word(1) as usize;
+        assert_eq!(n, 8 + count * 16);
+        assert_eq!(count, abi::uvm::v615_71_09::CMD.len());
+
+        for (i, c) in abi::uvm::v615_71_09::CMD.iter().enumerate() {
+            let at = 2 + i * 4;
+            assert_eq!(word(at), c.num, "command {i}");
+            assert_eq!(word(at + 1), c.params_size, "{:#x} size", c.num);
+            let (kind, off) = match c.fds {
+                [] => (0, 0),
+                [one] => (
+                    match one.kind {
+                        abi::uvm::Fd::Ctl => 1,
+                        abi::uvm::Fd::Uvm => 2,
+                        abi::uvm::Fd::Foreign => 3,
+                    },
+                    one.at as u32,
+                ),
+                _ => unreachable!("a_uvm_command_carries_at_most_one_descriptor"),
+            };
+            assert_eq!(word(at + 2), kind, "{:#x} descriptor kind", c.num);
+            assert_eq!(word(at + 3), off, "{:#x} descriptor offset", c.num);
+        }
+
+        // The eight that carry one, so a change to the generator that dropped
+        // them would not pass quietly.
+        assert_eq!(
+            (0..count).filter(|i| word(2 + i * 4 + 2) != 0).count(),
+            8,
+            "615.71.09 carries eight descriptors"
+        );
+    }
+
+    /// Nothing learned about the host means nothing said about UVM, and the
+    /// guest refuses every UVM call rather than reading a zeroed buffer as an
+    /// answer. That is what the magic word is for.
+    #[test]
+    fn a_backend_with_no_release_describes_no_uvm_call() {
+        let be = NvidiaBackend::for_test();
+        let mut buf = vec![0u8; 8192];
+        assert_eq!(be.write_uvm_section(&mut buf), 0);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
     /// Without a release nothing says what a UVM call is, so nothing is one.
     #[test]
     fn no_uvm_call_is_served_before_the_release_is_known() {

@@ -269,6 +269,25 @@ mod tests {
     /// Every descriptor and every handle has to lie inside the struct it is
     /// an offset into. An offset past the end is a read of whatever follows
     /// the parameter block.
+    /// The wire format the backend publishes to the guest has room for one
+    /// descriptor per command. Nothing in UVM promises that, so it is asserted
+    /// here: a release that brings a second makes this fail rather than making
+    /// the guest quietly drop one.
+    #[test]
+    fn a_uvm_command_carries_at_most_one_descriptor() {
+        for p in PROFILES {
+            for c in (p.cmd)() {
+                assert!(
+                    c.fds.len() <= 1,
+                    "{}: {:#x} carries {} descriptors; the guest is told of one",
+                    p.version,
+                    c.num,
+                    c.fds.len()
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_descriptor_fits_its_parameter_block() {
         for p in PROFILES {

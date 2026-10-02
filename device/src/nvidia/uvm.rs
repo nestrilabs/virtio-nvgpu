@@ -99,7 +99,7 @@ impl NvidiaBackend {
         let mut restore: Vec<(usize, [u8; 4])> = Vec::new();
         for slot in entry.fds {
             let raw = i32::from_le_bytes(param_buf[slot.at..slot.at + 4].try_into().unwrap());
-            let host = match self.uvm_descriptor(num, slot, raw) {
+            let host = match self.uvm_descriptor(slot, raw) {
                 Ok(fd) => fd,
                 Err(why) => {
                     self.note_allow_refusal(format!("UVM {num:#x}"), why);
@@ -157,7 +157,6 @@ impl NvidiaBackend {
     /// This backend's descriptor for one the guest put inside a UVM call.
     fn uvm_descriptor(
         &self,
-        num: u32,
         slot: &abi::uvm::FdSlot,
         raw: i32,
     ) -> std::result::Result<i32, String> {
@@ -167,10 +166,11 @@ impl NvidiaBackend {
         // guest could be naming here. Refusing says so; forwarding the number
         // would hand UVM whichever of our files sits at it.
         if slot.kind == Fd::Foreign {
-            return Err(format!(
-                "UVM {num:#x} imports a descriptor this backend did not open, and nothing \
-                 here can translate it"
-            ));
+            return Err(
+                "it imports a descriptor this backend did not open, and nothing here \
+                        can translate it"
+                    .into(),
+            );
         }
 
         // UVM resolves the descriptor in every call that carries one -- all
@@ -178,17 +178,16 @@ impl NvidiaBackend {
         // "none" to pass through, unlike RM's -1.
         if raw < 0 {
             return Err(format!(
-                "UVM {num:#x} needs a descriptor and was sent {raw}"
+                "it needs a descriptor at byte {} and was sent {raw}",
+                slot.at
             ));
         }
 
         let guest = raw as u64;
-        let fd = self.handles.get_raw(guest).map_err(|_| {
-            format!(
-                "UVM {num:#x} names descriptor {guest}, which this VM has not \
-                                  opened"
-            )
-        })?;
+        let fd = self
+            .handles
+            .get_raw(guest)
+            .map_err(|_| format!("descriptor {guest} is not one this VM opened"))?;
 
         let want = match slot.kind {
             Fd::Ctl => DeviceKind::Ctl,
@@ -198,7 +197,7 @@ impl NvidiaBackend {
         match self.handle_kinds.get(&guest) {
             Some(k) if *k == want => Ok(fd),
             other => Err(format!(
-                "UVM {num:#x} wants {want:?} at byte {} and descriptor {guest} is {other:?}",
+                "it wants {want:?} at byte {} and descriptor {guest} is {other:?}",
                 slot.at
             )),
         }
