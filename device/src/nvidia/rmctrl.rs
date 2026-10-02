@@ -62,9 +62,24 @@ fn sent<'b>(
     segs: Option<Segments<'b>>,
     legacy: Option<(usize, &'b [u8])>,
     ptr_offset: usize,
-) -> Option<&'b [u8]> {
+) -> Option<(&'b [u8], Source)> {
     segs.and_then(|s| s.find(ptr_offset as u32))
-        .or_else(|| legacy.filter(|(off, _)| *off == ptr_offset).map(|(_, b)| b))
+        .map(|b| (b, Source::Segment))
+        .or_else(|| {
+            legacy
+                .filter(|(off, _)| *off == ptr_offset)
+                .map(|(_, b)| (b, Source::Legacy))
+        })
+}
+
+/// Which encoding a guest's bytes arrived in, which is also how far its own
+/// idea of their length can be trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    /// A segment table, from a guest reading this same table.
+    Segment,
+    /// The single pointer a v0.1 guest describes in the request struct.
+    Legacy,
 }
 
 pub(super) fn plan(
@@ -111,17 +126,25 @@ pub(super) fn plan(
         }
 
         if p.copy_in && len > 0 {
-            // The guest derives this length from the same count in the same
-            // field of the same block, so the two halves agree exactly or they
-            // disagree about the layout -- and a length read from a different
-            // place is not something to resolve by taking the smaller number.
-            // Fewer bytes than RM will read used to be zero-filled here, which
-            // is safe for this process and gives the caller an answer computed
-            // from data it never sent.
             match sent(segs, legacy, p.ptr_offset) {
-                Some(bytes) if bytes.len() == len => {}
-                Some(_) => return Err(NV_ERR_NOT_SUPPORTED),
-                None => return Err(NV_ERR_NOT_SUPPORTED),
+                // A segment comes from a guest deriving its length from this
+                // same table, from the same count in the same field. It
+                // matches exactly or the two halves disagree about the layout,
+                // which is not something to resolve by taking the smaller
+                // number.
+                Some((bytes, Source::Segment)) if bytes.len() == len => {}
+                Some((_, Source::Segment)) | None => return Err(NV_ERR_NOT_SUPPORTED),
+
+                // A v0.1 guest derived its length from a table of its own, and
+                // for some controls derived it differently: it sends
+                // `engineCount` bytes where this table reads `engineCount`
+                // four-byte entries. Refusing that loses the control, and the
+                // module in a guest's rootfs cannot be fixed after the fact.
+                // What it sent is copied and the rest left zero -- wrong for
+                // that caller if its table was wrong, and no less safe here,
+                // because the length RM reads is this backend's either way.
+                Some((bytes, Source::Legacy)) if bytes.len() <= len => {}
+                Some((_, Source::Legacy)) => return Err(NV_ERR_NOT_SUPPORTED),
             }
         }
 
@@ -188,7 +211,7 @@ impl<'a> Embedded<'a> {
             buf.as_mut_slice().fill(0);
 
             if slot.copy_in
-                && let Some(bytes) = sent(segs, legacy, slot.ptr_offset)
+                && let Some((bytes, _)) = sent(segs, legacy, slot.ptr_offset)
             {
                 // `plan` refused any length but this one.
                 buf.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
@@ -420,6 +443,29 @@ mod tests {
 
     /// Short, or missing altogether. Both used to be zero-filled, which gave
     /// the caller an answer RM computed from data the guest never sent.
+    /// The case that cost an encode probe its NVENC: a v0.1 module sends
+    /// `engineCount` bytes where this table reads `engineCount` four-byte
+    /// entries, and refusing it loses the control on a guest nobody can patch.
+    #[test]
+    fn a_short_block_from_a_v0_1_guest_is_served_rather_than_refused() {
+        let pool = std::cell::RefCell::new(GuardPool::default());
+        let e = entry(LIST, 16);
+        let mut p = block(16, 2, 8); // this table says 2 x 8 = 16 bytes
+        let short = [9u8, 9]; // what a v0.1 guest sent
+
+        let slots = plan(&e, &p, None, Some((8, &short))).expect("served");
+        assert_eq!(slots[0].len, 16);
+        let emb = Embedded::install(&slots, &mut p, None, Some((8, &short)), &pool).unwrap();
+        assert_eq!(&emb.reply()[0].1[..4], &[9, 9, 0, 0]);
+
+        // More than the table's length is a disagreement either way.
+        let long = [9u8; 32];
+        assert_eq!(
+            plan(&e, &p, None, Some((8, &long))),
+            Err(NV_ERR_NOT_SUPPORTED)
+        );
+    }
+
     #[test]
     fn a_segment_the_count_does_not_match_is_refused() {
         let e = entry(LIST, 16);
@@ -428,6 +474,7 @@ mod tests {
         let n = wire(&mut w, &[(8, &[7u8; 8])]);
         let s = Segments::parse(&w[..n]).unwrap();
         assert_eq!(plan(&e, &p, Some(s), None), Err(NV_ERR_NOT_SUPPORTED));
+        // Nothing sent at all is refused whichever guest it came from.
         assert_eq!(plan(&e, &p, None, None), Err(NV_ERR_NOT_SUPPORTED));
     }
 

@@ -26,6 +26,12 @@ impl NvidiaBackend {
         };
         self.driver = Some(v);
         self.abi = abi::versions::table_for(v);
+        // The RM pointer table goes with it. A caller that learns the release
+        // this way rather than through `set_host_driver_version` -- another
+        // VMM embedding this crate -- would otherwise have an ABI profile and
+        // no pointer table, and every control that carries a pointer would go
+        // through undescribed, which is what this crate stopped doing in M3.
+        self.rmctrl = abi::rmctrl::select(v);
         match self.abi {
             Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
             None => log::warn!(

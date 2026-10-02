@@ -136,6 +136,16 @@ pub struct FdTranslation {
     pub payload_offset: u32,
 }
 
+/// This backend reads a deep block that holds several segments, one per
+/// pointer inside an RM control's parameters, announced by
+/// `deep_ptr_offset == protocol::segments::SEGMENTED`.
+///
+/// A guest that sends one to a backend without this bit has every described
+/// control refused: a v0.1 backend reads the marker as a real offset and finds
+/// it outside the parameter block. So the guest sends segments only when it
+/// sees this.
+pub const FEATURE_RMCTRL_SEGMENTS: u32 = 1 << 0;
+
 /// Device configuration space.
 ///
 /// Mirrors `struct virtio_gpu_nv_config`, which the driver asserts is 4016
@@ -162,7 +172,11 @@ pub struct VirtioGpuNvConfig {
     pub gpu_device_ids: [u32; MAX_GPUS],
     pub gpus: [GpuSlot; MAX_GPUS],
     pub num_fd_translations: u32,
-    pub _pad: u32,
+    /// What this backend can do beyond v0.1, as [`FEATURE_RMCTRL_SEGMENTS`]
+    /// and the like. This was padding; a backend from before it sent zero,
+    /// which reads as "none of these", so the guest needs no version to read
+    /// it and the struct's layout does not change.
+    pub features: u32,
     pub fd_translations: [FdTranslation; MAX_FD_TRANSLATIONS],
 }
 
@@ -175,7 +189,7 @@ impl Default for VirtioGpuNvConfig {
             gpu_device_ids: [0; MAX_GPUS],
             gpus: [GpuSlot::default(); MAX_GPUS],
             num_fd_translations: 0,
-            _pad: 0,
+            features: 0,
             fd_translations: [FdTranslation::default(); MAX_FD_TRANSLATIONS],
         }
     }
@@ -190,6 +204,7 @@ impl VirtioGpuNvConfig {
     pub fn new(driver_version: &str, gpus: &[GpuSlot], caps: crate::caps::Caps) -> Self {
         let mut cfg = Self::default();
         cfg.caps = caps.bits();
+        cfg.features = FEATURE_RMCTRL_SEGMENTS;
         let v = driver_version.as_bytes();
         let n = v.len().min(DRIVER_VERSION_LEN - 1);
         cfg.driver_version[..n].copy_from_slice(&v[..n]);

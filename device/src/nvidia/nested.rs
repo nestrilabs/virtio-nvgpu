@@ -265,7 +265,19 @@ impl NvidiaBackend {
                 let found = self
                     .rmctrl
                     .and_then(|sel| abi::rmctrl::lookup(sel.table, cmd));
-                if found.is_none()
+                // No table at all is the one case where nothing can be said
+                // about any control, so nothing is forwarded. It cannot happen
+                // through `set_host_driver_version`, which refuses to start
+                // without one, but this crate is built into other VMMs and a
+                // caller that never calls it would otherwise get the behaviour
+                // M3 removed.
+                if self.rmctrl.is_none() {
+                    log::warn!(
+                        "RM_CONTROL cmd={cmd:#010x}: no RM pointer table for this host, so \
+                         nothing can be said about the pointers in it; refused"
+                    );
+                    drift_refusal = Some(rmctrl::NV_ERR_NOT_SUPPORTED);
+                } else if found.is_none()
                     && self.rmctrl.is_some_and(|sel| !sel.exact)
                     && abi::rmctrl::in_any_table(cmd)
                 {
