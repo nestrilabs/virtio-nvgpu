@@ -34,33 +34,6 @@ const NVOS54_TOTAL: usize = 32;
 /// `NV_OK`. Every other value is a refusal of some kind.
 const NV_OK: u32 = 0;
 
-/// UVM's ioctl number for UVM_INITIALIZE (nvidia-uvm/uvm_linux_ioctl.h). Its
-/// block is `flags: u64` then `rmStatus: u32`.
-const UVM_INITIALIZE_CMD: u64 = 0x3000_0001;
-/// UVM_INIT_FLAGS_* (nvidia-uvm/uvm_types.h).
-const UVM_INIT_DISABLE_HMM: u64 = 0x1;
-const UVM_INIT_MULTI_PROCESS_SHARING_MODE: u64 = 0x2;
-/// From 610.43.02 only; older UVM refuses the call with any bit it does not
-/// know (uvm_va_space.c, `flags & ~UVM_INIT_FLAGS_MASK`).
-const UVM_INIT_DISABLE_PAGEABLE_ACCESS: u64 = 0x4;
-const UVM_PAGEABLE_FLAG_SINCE: abi::version::DriverVersion =
-    abi::version::DriverVersion::new(610, 43, 2);
-
-/// The flags UVM_INITIALIZE goes to the host with, whatever the guest asked.
-///
-/// Every guest process's UVM file is opened by the backend, so a VA space UVM
-/// ties to the caller's mm would be tied to the backend's, and with HMM or
-/// pageable access the GPU could fault in the backend's own pages. Sharing
-/// mode ties the VA space to no mm, and the other bits turn HMM and pageable
-/// access off where the host release has them.
-pub fn uvm_init_flags(host: abi::version::DriverVersion) -> u64 {
-    let mut f = UVM_INIT_DISABLE_HMM | UVM_INIT_MULTI_PROCESS_SHARING_MODE;
-    if host >= UVM_PAGEABLE_FLAG_SINCE {
-        f |= UVM_INIT_DISABLE_PAGEABLE_ACCESS;
-    }
-    f
-}
-
 /// The host path an `Open` refers to.
 ///
 /// The wire encoding is one flat `u32`: a GPU is its own minor number and the
@@ -237,6 +210,14 @@ pub struct NvidiaBackend {
     /// the host, not to the guest. So the backend applies it on the guest's
     /// behalf, before forwarding. See `abi::rmallow`.
     rmallow: Option<abi::rmallow::Selected>,
+    /// The UVM commands the host release defines, their sizes, and where the
+    /// descriptors sit in them. `None` until the release is known, and until
+    /// then nothing says what a UVM call even is, so none is served.
+    uvm: Option<abi::uvm::Selected>,
+    /// UVM files whose VA space was found to allow pageable access on a
+    /// release with no flag to forbid it. The host file is initialised by the
+    /// time the answer comes back, so the refusal attaches to the handle.
+    uvm_denied: std::collections::HashSet<u64>,
     /// Controls and classes refused by the RM allowlist, by what was asked
     /// for and why. Reported at teardown.
     ///
@@ -352,6 +333,8 @@ impl NvidiaBackend {
             caps_refused: std::collections::BTreeMap::new(),
             vram: crate::vram::Vram::new(None),
             rmallow: None,
+            uvm: None,
+            uvm_denied: std::collections::HashSet::new(),
             allow_refused: std::collections::BTreeMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: std::collections::BTreeMap::new(),
@@ -456,6 +439,14 @@ impl NvidiaBackend {
             return Err(format!("host driver {v} has no RM allowlist"));
         };
         self.rmallow = Some(allow);
+        // And for UVM. Nothing here is a privilege rule -- UVM has none to
+        // read -- but without the table a UVM call has no size to be checked
+        // against and no way to say where its descriptors are, which is the
+        // whole of what the backend can check there.
+        let Some(uvm) = abi::uvm::select(v) else {
+            return Err(format!("host driver {v} has no UVM command table"));
+        };
+        self.uvm = Some(uvm);
         log::info!(
             "host driver {v}: {} RM controls carry a pointer RM dereferences",
             sel.table.len()
@@ -759,6 +750,7 @@ mod resp;
 mod rm_fd;
 mod rmctrl;
 mod simple;
+mod uvm;
 mod window;
 
 #[cfg(test)]

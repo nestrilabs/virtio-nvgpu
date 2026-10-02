@@ -33,6 +33,7 @@ impl NvidiaBackend {
         // through undescribed, which is what this crate stopped doing in M3.
         self.rmctrl = abi::rmctrl::select(v);
         self.rmallow = abi::rmallow::select(v);
+        self.uvm = abi::uvm::select(v);
         match self.abi {
             Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
             None => log::warn!(
@@ -203,7 +204,7 @@ impl NvidiaBackend {
     }
 
     /// Count a refusal, and say why the first time.
-    fn note_allow_refusal(&mut self, what: String, why: String) {
+    pub(super) fn note_allow_refusal(&mut self, what: String, why: String) {
         let n = self.allow_refused.entry(what.clone()).or_insert(0);
         *n += 1;
         if *n == 1 {
@@ -287,21 +288,34 @@ impl NvidiaBackend {
 
         // Counted before anything decides whether to serve it, so a refusal
         // still shows up as something the workload asked for.
+        let on_uvm = self.handle_kinds.get(&(self.current_handle as u64)) == Some(&DeviceKind::Uvm);
         let ns = match ioc_type {
+            _ if on_uvm => 'u',
             x if x == b'F' as u32 => 'F',
             x if x == b'd' as u32 => 'd',
             x if x == b'm' as u32 => 'm',
-            0 => 'u', // UVM: type 0, and it has no table either
             _ => '?',
         };
-        *self.ioctls_by_ns.entry((ns, escape)).or_insert(0) += 1;
+        // UVM is counted by its whole number, not by the low byte: 0x30000001
+        // and 1 are different commands that share one. Everywhere else the low
+        // byte is the escape and the rest is encoding.
+        let counted = if on_uvm { request as u32 } else { escape };
+        *self.ioctls_by_ns.entry((ns, counted)).or_insert(0) += 1;
 
-        // Only NVIDIA's own magic is described by the ABI tables; modeset and
-        // uvm use different namespaces.
+        // A UVM file takes UVM's numbering, and the number alone cannot say so:
+        // UVM_INITIALIZE is 0x30000001 and UVM_RESERVE_VA is 1, and the two
+        // agree in every byte an ioctl type is read from. The file the guest
+        // sent it on is what distinguishes them, so that is what decides.
+        if on_uvm {
+            return self.dispatch_uvm(cookie, host_fd, request, param_in, resp_buf);
+        }
+
+        // Only NVIDIA's own magic is described by the ABI tables; modeset uses
+        // a different namespace.
         if ioc_type == b'F' as u32 {
-            // Only NVIDIA's own magic is described by the tables. UVM (type 0)
-            // and modeset ('m') are forwarded with no equivalent check, which
-            // is a gap and not a decision.
+            // Only NVIDIA's own magic is described by the tables. Modeset
+            // ('m') is forwarded with no equivalent check, which is a gap and
+            // not a decision. UVM has a table of its own: see `dispatch_uvm`.
             let refuse = match self.check_abi(escape, ireq.data_len) {
                 AbiCheck::SizeMismatch { expected, actual } => {
                     log::warn!(
@@ -420,28 +434,6 @@ impl NvidiaBackend {
         // commands -- nvidia-drm's DMABUF_SUPPORTED is nr 0x4f, which is
         // NV_ESC_RM_UNMAP_MEMORY here -- so anything that is not RM is handed
         // to the host as it arrived rather than matched against this table.
-        // UVM_INITIALIZE goes with the backend's flags, not the guest's
-        // (uvm_init_flags). Before the host release is known nothing says which
-        // bits it takes, so the call is refused: a CUDA client learns the
-        // release on nvidiactl before it opens UVM.
-        if request == UVM_INITIALIZE_CMD {
-            let Some(host) = self.driver else {
-                log::warn!("UVM_INITIALIZE before the host driver release is known; refused");
-                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
-            };
-            if param_in.len() < 16 {
-                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
-            }
-            let asked = u64::from_le_bytes(param_in[0..8].try_into().unwrap());
-            let flags = uvm_init_flags(host);
-            if asked != flags {
-                log::debug!("UVM_INITIALIZE: guest asked flags {asked:#x}, sent {flags:#x}");
-            }
-            let mut p = param_in.to_vec();
-            p[0..8].copy_from_slice(&flags.to_le_bytes());
-            return self.dispatch_simple(cookie, host_fd, request, &p, resp_buf);
-        }
-
         if ioc_type != b'F' as u32 {
             return self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf);
         }

@@ -27,15 +27,23 @@ mod abi_tests {
         assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
     }
 
+    /// The flags are the release's own, not a version comparison written here.
+    /// 535/580/595 have no DISABLE_PAGEABLE_ACCESS bit -- their mask is 0x3 --
+    /// and on those releases the backend has to establish the same thing by
+    /// asking, which is what `pageable_must_be_off` says.
     #[test]
     fn uvm_initialize_always_gets_sharing_mode_and_no_hmm() {
         use abi::version::DriverVersion as V;
-        // 595 takes 0x1 and 0x2 (mask 0x3); 610.43.02 adds 0x4.
-        assert_eq!(uvm_init_flags(V::new(595, 104, 2)), 0x3);
-        assert_eq!(uvm_init_flags(V::new(580, 178, 4)), 0x3);
-        assert_eq!(uvm_init_flags(V::new(610, 43, 1)), 0x3);
-        assert_eq!(uvm_init_flags(V::new(610, 43, 2)), 0x7);
-        assert_eq!(uvm_init_flags(V::new(615, 71, 9)), 0x7);
+        for (v, flags, must_ask) in [
+            (V::new(535, 129, 3), 0x3, true),
+            (V::new(580, 178, 4), 0x3, true),
+            (V::new(595, 104, 2), 0x3, true),
+            (V::new(615, 71, 9), 0x7, false),
+        ] {
+            let sel = abi::uvm::select(v).expect("a table for every release here");
+            assert_eq!(sel.init_flags(), flags, "{v}");
+            assert_eq!(sel.pageable_must_be_off(), must_ask, "{v}");
+        }
     }
 
     #[test]
@@ -1397,5 +1405,310 @@ mod tests {
             "{cycles} cycles leaked host file descriptors"
         );
         c.be.teardown();
+    }
+
+    // ==================================================================
+    // UVM
+    // ==================================================================
+
+    /// A fake UVM: records every call with the bytes it was given, and answers
+    /// `UVM_PAGEABLE_MEM_ACCESS` with whatever the test set.
+    /// Every call the fake saw: the number, and the bytes it was handed.
+    type UvmLog = std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>;
+
+    #[derive(Clone)]
+    struct UvmHost {
+        calls: UvmLog,
+        pageable: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    }
+
+    impl Default for UvmHost {
+        fn default() -> Self {
+            Self {
+                calls: Default::default(),
+                pageable: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            }
+        }
+    }
+
+    impl HostDriver for UvmHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.calls.lock().unwrap().push((request, arg.to_vec()));
+            if request == 0x27 && arg.len() >= 8 {
+                arg[0] = self.pageable.load(std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    impl UvmHost {
+        fn calls(&self) -> Vec<(u64, Vec<u8>)> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn nums(&self) -> Vec<u64> {
+            self.calls().into_iter().map(|(n, _)| n).collect()
+        }
+        /// The VA space reports pageable access on, as it would on a host with
+        /// HMM or ATS available and a release with no flag to refuse it.
+        fn pageable_is_on(&self) {
+            self.pageable.store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A backend on `v` with a UVM file and a control file already open, and
+    /// the handle of each.
+    fn uvm_backend(host: &UvmHost, v: abi::version::DriverVersion) -> (NvidiaBackend, u64, u64) {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(v)
+            .unwrap_or_else(|e| panic!("{v}: {e}"));
+        be.set_host(Box::new(host.clone()));
+        let mut open = |kind| {
+            let null = std::fs::File::open("/dev/null").expect("/dev/null");
+            let h = be.handles.insert(OwnedFd::from(null));
+            be.handle_kinds.insert(h, kind);
+            h
+        };
+        let uvm = open(DeviceKind::Uvm);
+        let ctl = open(DeviceKind::Ctl);
+        (be, uvm, ctl)
+    }
+
+    /// A UVM message. The command number is the ioctl number itself -- on
+    /// Linux `UVM_IOCTL_BASE(i)` is `i` -- so nothing is encoded around it.
+    fn uvm_msg(handle: u64, num: u64, params: &[u8]) -> Vec<u8> {
+        let mut v = hdr(MsgType::Ioctl, handle);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: num as u32,
+                data_len: params.len() as u32,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(params);
+        v
+    }
+
+    fn send_uvm(be: &mut NvidiaBackend, h: u64, num: u64, params: &[u8]) -> Vec<u8> {
+        let mut resp = vec![0u8; 64 * 1024];
+        be.dispatch(&uvm_msg(h, num, params), &mut resp);
+        resp
+    }
+
+    const UVM_RESERVE_VA: u64 = 0x01;
+    const UVM_REGISTER_GPU: u64 = 0x25;
+    const UVM_PAGEABLE_MEM_ACCESS: u64 = 0x27;
+    const UVM_IMPORT_DMA_BUF: u64 = 0x53;
+    const UVM_INITIALIZE: u64 = 0x3000_0001;
+    /// `rmCtrlFd` and `hClient` in `UVM_REGISTER_GPU_PARAMS`.
+    const REGISTER_GPU_FD: usize = 24;
+
+    fn v615() -> abi::version::DriverVersion {
+        abi::version::DriverVersion::new(615, 71, 9)
+    }
+
+    #[test]
+    fn a_uvm_command_the_release_defines_reaches_the_host() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        let resp = send_uvm(&mut be, uvm, UVM_RESERVE_VA, &[0u8; 24]);
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.nums(), vec![UVM_RESERVE_VA]);
+    }
+
+    /// The table is the whole check UVM gets: it has no flags word, so nothing
+    /// says who may call what, only what each call is.
+    #[test]
+    fn a_uvm_command_the_release_does_not_define_never_reaches_the_host() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        // 0x08 sits in a gap: UVM_ADD_SESSION is 0x0a and UVM_SET_STREAM_STOPPED
+        // is 0x07.
+        assert!(
+            !abi::uvm::v615_71_09::CMD.iter().any(|c| c.num == 0x08),
+            "0x08 must stay undefined for this test to mean anything"
+        );
+        let resp = send_uvm(&mut be, uvm, 0x08, &[0u8; 24]);
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    /// UVM copies its own struct's worth of bytes whatever the guest declared,
+    /// so a short block is a read past what arrived.
+    #[test]
+    fn a_uvm_command_at_the_wrong_size_never_reaches_the_host() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        let resp = send_uvm(&mut be, uvm, UVM_RESERVE_VA, &[0u8; 16]);
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    /// The descriptor the guest wrote names nothing in this process. What
+    /// reaches UVM is the backend's own, and what comes back is the guest's.
+    #[test]
+    fn a_descriptor_inside_a_uvm_call_is_translated_both_ways() {
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        let host_ctl = be.handles.get_raw(ctl).expect("the control file is open");
+
+        let mut p = vec![0u8; 40];
+        p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&(ctl as i32).to_le_bytes());
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &p);
+        assert_eq!(parse_resp(&resp).status, 0);
+
+        let (_, sent) = host.calls().pop().expect("one call");
+        let seen = i32::from_le_bytes(
+            sent[REGISTER_GPU_FD..REGISTER_GPU_FD + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            seen, host_ctl,
+            "UVM must be given this process's descriptor"
+        );
+
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let back = i32::from_le_bytes(
+            resp[body + REGISTER_GPU_FD..body + REGISTER_GPU_FD + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(back, ctl as i32, "the guest reads back the number it wrote");
+    }
+
+    /// A call wanting `nvidiactl` handed a UVM file is a different call than
+    /// the one UVM would act on, so the kind is checked and not just the
+    /// ownership.
+    #[test]
+    fn a_descriptor_of_the_wrong_kind_is_refused() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        let mut p = vec![0u8; 40];
+        p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&(uvm as i32).to_le_bytes());
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &p);
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    #[test]
+    fn a_descriptor_this_vm_never_opened_is_refused() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        for raw in [-1i32, 0, 4096] {
+            let mut p = vec![0u8; 40];
+            p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&raw.to_le_bytes());
+            let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &p);
+            assert_ne!(parse_resp(&resp).status, 0, "descriptor {raw}");
+        }
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    /// There is no dma-buf this backend handed out, so the number can only
+    /// name one of its own files by accident.
+    #[test]
+    fn a_foreign_descriptor_is_refused_rather_than_guessed_at() {
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        let entry = abi::uvm::select(v615())
+            .unwrap()
+            .entry(UVM_IMPORT_DMA_BUF as u32)
+            .expect("615 imports dma-bufs");
+        let slot = entry.fds.first().expect("it carries a descriptor");
+        assert_eq!(slot.kind, abi::uvm::Fd::Foreign);
+
+        let mut p = vec![0u8; entry.params_size as usize];
+        p[slot.at..slot.at + 4].copy_from_slice(&(ctl as i32).to_le_bytes());
+        let resp = send_uvm(&mut be, uvm, UVM_IMPORT_DMA_BUF, &p);
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    /// Every guest process's UVM file is opened here, so a VA space tied to
+    /// the caller's mm is tied to *this* process's. The guest does not get to
+    /// ask for one.
+    #[test]
+    fn uvm_initialize_goes_with_the_backend_s_flags() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        let mut p = vec![0u8; 16];
+        p[0..8].copy_from_slice(&0u64.to_le_bytes()); // HMM on, no sharing mode
+        let resp = send_uvm(&mut be, uvm, UVM_INITIALIZE, &p);
+        assert_eq!(parse_resp(&resp).status, 0);
+        let (_, sent) = host.calls().remove(0);
+        assert_eq!(
+            u64::from_le_bytes(sent[0..8].try_into().unwrap()),
+            0x7,
+            "615.71.09 has all three bits"
+        );
+    }
+
+    /// 535/580/595 have no DISABLE_PAGEABLE_ACCESS bit, so the backend cannot
+    /// ask for it and has to establish it instead.
+    #[test]
+    fn an_older_release_is_asked_whether_pageable_access_is_off() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, abi::version::DriverVersion::new(595, 104, 2));
+        let resp = send_uvm(&mut be, uvm, UVM_INITIALIZE, &[0u8; 16]);
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.nums(), vec![UVM_INITIALIZE, UVM_PAGEABLE_MEM_ACCESS]);
+        let (_, sent) = host.calls().remove(0);
+        assert_eq!(
+            u64::from_le_bytes(sent[0..8].try_into().unwrap()),
+            0x3,
+            "595 has no bit for pageable access and must not be sent one"
+        );
+    }
+
+    /// 615 has the bit, so it is asked for and nothing needs establishing
+    /// afterwards.
+    #[test]
+    fn a_release_with_the_flag_is_not_asked() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        send_uvm(&mut be, uvm, UVM_INITIALIZE, &[0u8; 16]);
+        assert_eq!(host.nums(), vec![UVM_INITIALIZE]);
+    }
+
+    /// The refusal, triggered. Pageable access lets the GPU fault on host
+    /// memory the guest never registered; an untriggered check against that is
+    /// indistinguishable from a broken one.
+    #[test]
+    fn a_va_space_that_allows_pageable_access_serves_nothing_further() {
+        let host = UvmHost::default();
+        host.pageable_is_on();
+        let (mut be, uvm, _) = uvm_backend(&host, abi::version::DriverVersion::new(595, 104, 2));
+
+        let resp = send_uvm(&mut be, uvm, UVM_INITIALIZE, &[0u8; 16]);
+        assert_ne!(
+            parse_resp(&resp).status,
+            0,
+            "UVM_INITIALIZE must be refused"
+        );
+
+        // The host file is initialised by now and cannot be un-initialised, so
+        // the refusal has to stick to the handle.
+        let before = host.nums().len();
+        let resp = send_uvm(&mut be, uvm, UVM_RESERVE_VA, &[0u8; 24]);
+        assert_ne!(parse_resp(&resp).status, 0, "the file is finished");
+        assert_eq!(host.nums().len(), before, "host heard {:x?}", host.nums());
+    }
+
+    /// Without a release nothing says what a UVM call is, so nothing is one.
+    #[test]
+    fn no_uvm_call_is_served_before_the_release_is_known() {
+        let host = UvmHost::default();
+        let mut be = NvidiaBackend::for_test();
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let uvm = be.handles.insert(OwnedFd::from(null));
+        be.handle_kinds.insert(uvm, DeviceKind::Uvm);
+
+        let resp = send_uvm(&mut be, uvm, UVM_RESERVE_VA, &[0u8; 24]);
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
     }
 }
