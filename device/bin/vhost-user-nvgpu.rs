@@ -303,6 +303,11 @@ struct NvGpuBackend {
     /// Started on the first message, because the event queue and guest memory
     /// are not known before then.
     watches: Option<Sender<Watch>>,
+    /// The request and response of the chain being served, kept across chains.
+    /// A fresh 64 KiB response zeroed per request cost more than the host's
+    /// whole RM call, and only the bytes dispatch writes are sent back.
+    req: Vec<u8>,
+    resp: Vec<u8>,
 }
 
 impl NvGpuBackend {
@@ -342,6 +347,8 @@ impl NvGpuBackend {
             // can enumerate the GPU before the shared window exists.
             config: VirtioGpuNvConfig::new(&version, &gpus, caps),
             watches: None,
+            req: Vec::new(),
+            resp: vec![0u8; RESP_MAX],
         })
     }
 
@@ -408,30 +415,30 @@ impl NvGpuBackend {
             drop(guard);
 
             let head = chain.head_index();
-            let mut req = Vec::new();
             let mut resp_desc = None;
+            self.req.clear();
 
             for desc in chain.clone() {
                 if desc.is_write_only() {
                     resp_desc = Some(desc);
                 } else {
-                    let mut buf = vec![0u8; desc.len() as usize];
-                    mem.read_slice(&mut buf, desc.addr()).map_err(|e| {
+                    let at = self.req.len();
+                    self.req.resize(at + desc.len() as usize, 0);
+                    mem.read_slice(&mut self.req[at..], desc.addr()).map_err(|e| {
                         std::io::Error::other(format!("read request descriptor: {e}"))
                     })?;
-                    req.extend_from_slice(&buf);
                 }
             }
 
             let written = match resp_desc {
                 Some(d) => {
                     let cap = std::cmp::min(d.len() as usize, RESP_MAX);
-                    let mut resp = vec![0u8; cap];
+                    let resp = &mut self.resp[..cap];
                     let n = self
                         .nvidia
                         .lock()
                         .expect("backend mutex")
-                        .dispatch(&req, &mut resp);
+                        .dispatch(&self.req, resp);
                     if n > 0 {
                         mem.write_slice(&resp[..n], d.addr()).map_err(|e| {
                             std::io::Error::other(format!("write response descriptor: {e}"))
