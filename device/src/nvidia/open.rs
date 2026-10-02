@@ -107,6 +107,12 @@ impl NvidiaBackend {
             self.vram.file_closed(handle);
         }
 
+        // Guest memory this file registered with RM. RM has let go of it by
+        // now, so the span that aliased the guest's pages goes too -- and this
+        // is what catches a registration freed as some parent's child, which
+        // the free path does not see.
+        self.drop_registrations_for_file(handle);
+
         match self.handles.remove(handle) {
             Ok(()) => {
                 log::debug!("close handle={handle}");

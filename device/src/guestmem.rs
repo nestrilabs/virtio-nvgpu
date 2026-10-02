@@ -246,19 +246,21 @@ pub fn stitch(ram: &dyn GuestRam, runs: &[Run], want: u64) -> Result<Stitched, S
     Ok(span)
 }
 
+/// Guest RAM the backend's own tests can run against, so a registration can
+/// be followed all the way to a host address without a VM.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fake {
     use super::*;
     use std::os::fd::FromRawFd;
 
     /// Guest RAM made of memfds, one per region, so the stitcher can be run
     /// against something whose contents are known.
-    struct FakeRam {
+    pub(crate) struct FakeRam {
         regions: Vec<(u64, u64, OwnedFd)>, // base, len, fd
     }
 
     impl FakeRam {
-        fn new(spans: &[(u64, u64)]) -> Self {
+        pub(crate) fn new(spans: &[(u64, u64)]) -> Self {
             let regions = spans
                 .iter()
                 .map(|&(base, len)| {
@@ -274,7 +276,7 @@ mod tests {
 
         /// Fill every page with a byte derived from its guest address, so a
         /// stitched span can be checked page by page.
-        fn fill(&self) {
+        pub(crate) fn fill(&self) {
             for &(base, len, ref fd) in &self.regions {
                 for page in 0..len / PAGE {
                     let b = [mark(base + page * PAGE); PAGE as usize];
@@ -292,7 +294,7 @@ mod tests {
         }
     }
 
-    fn mark(gpa: u64) -> u8 {
+    pub(crate) fn mark(gpa: u64) -> u8 {
         (gpa / PAGE) as u8 ^ 0xa5
     }
 
@@ -308,6 +310,12 @@ mod tests {
                 })
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::{FakeRam, mark};
+    use super::*;
 
     fn ram() -> FakeRam {
         // Two regions with a hole between them, as a real guest has.

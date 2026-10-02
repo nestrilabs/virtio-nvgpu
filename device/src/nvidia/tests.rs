@@ -1546,6 +1546,437 @@ mod tests {
         assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
     }
 
+    // ------------------------------------------------------------------
+    // ...and translated, once the guest says where its pages are.
+    // ------------------------------------------------------------------
+
+    const TPAGE: u64 = 4096;
+
+    /// A host that answers a registration, and reads back what it was given.
+    ///
+    /// This is the only place the whole translation can be judged: RM's half
+    /// of it is to dereference the address, and so this does, page by page,
+    /// and says what it found.
+    #[derive(Clone)]
+    struct RegisteringHost {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+        /// What the pages behind the address read back as, one byte per page.
+        seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        address_at: usize,
+        status_at: usize,
+        hmemory_at: usize,
+        pages: u64,
+        handle: u32,
+    }
+
+    impl RegisteringHost {
+        fn new(address_at: usize, status_at: usize, hmemory_at: usize, pages: u64) -> Self {
+            Self {
+                calls: Default::default(),
+                seen: Default::default(),
+                address_at,
+                status_at,
+                hmemory_at,
+                pages,
+                handle: 0xcafe_0001,
+            }
+        }
+        fn calls(&self) -> Vec<u64> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn seen(&self) -> Vec<u8> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl HostDriver for RegisteringHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.calls.lock().unwrap().push(request);
+            // NVOS00: hRoot, hObjectParent, hObjectOld, status.
+            if request & 0xFF == 0x29 {
+                arg[12..16].copy_from_slice(&0u32.to_le_bytes());
+                return Ok(());
+            }
+            let a = u64::from_le_bytes(
+                arg[self.address_at..self.address_at + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let mut seen = Vec::new();
+            for i in 0..self.pages {
+                // SAFETY: this is exactly what RM does with the address, and
+                // the span is mapped read-write for every byte of the length
+                // that came with it.
+                seen.push(unsafe { *((a + i * TPAGE) as *const u8) });
+            }
+            *self.seen.lock().unwrap() = seen;
+            arg[self.hmemory_at..self.hmemory_at + 4].copy_from_slice(&self.handle.to_le_bytes());
+            arg[self.status_at..self.status_at + 4].copy_from_slice(&0u32.to_le_bytes());
+            Ok(())
+        }
+    }
+
+    fn backend_for_registration(host: &RegisteringHost) -> (NvidiaBackend, u64) {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(615, 71, 9))
+            .expect("615.71.09 has tables");
+        be.set_host(Box::new(host.clone()));
+        let ram =
+            crate::guestmem::fake::FakeRam::new(&[(0, 16 * TPAGE), (1024 * TPAGE, 16 * TPAGE)]);
+        ram.fill();
+        be.set_guest_ram(Box::new(ram));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+        // The free path only reads what happened on a control file, and that
+        // is where every registration is made.
+        be.handle_kinds.insert(h, DeviceKind::Ctl);
+        (be, h)
+    }
+
+    /// An ioctl with a page-run table beside it, the way the guest driver
+    /// sends one.
+    fn ioctl_msg_with_runs(
+        handle: u64,
+        escape: u32,
+        params: &[u8],
+        runs: &[(u64, u64)],
+    ) -> Vec<u8> {
+        let runs: Vec<protocol::pageruns::Run> = runs
+            .iter()
+            .map(|&(gpa, len)| protocol::pageruns::Run { gpa, len })
+            .collect();
+        let mut table = vec![0u8; protocol::pageruns::encoded_len(runs.len())];
+        let n = protocol::pageruns::encode(&mut table, &runs).expect("the table fits");
+        table.truncate(n);
+
+        let mut v = hdr(MsgType::Ioctl, handle);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(escape, params.len() as u32) as u32,
+                data_len: params.len() as u32,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: protocol::pageruns::PAGE_RUNS,
+                deep_len: table.len() as u32,
+            },
+        );
+        v.extend_from_slice(params);
+        v.extend_from_slice(&table);
+        v
+    }
+
+    /// NVOS00: hRoot, hObjectParent, hObjectOld, status.
+    fn free_params(client: u32, object: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 16];
+        p[0..4].copy_from_slice(&client.to_le_bytes());
+        p[8..12].copy_from_slice(&object.to_le_bytes());
+        p
+    }
+
+    /// A heap registration whose pages the guest named: two pages from two
+    /// different regions of guest RAM, with a hole between them.
+    fn heap_registration(d: &abi::osdesc::OsDesc, client: u32) -> Vec<u8> {
+        let mut p = vec![0u8; d.vid_heap.params_size];
+        p[0..4].copy_from_slice(&client.to_le_bytes());
+        let f = d.vid_heap_function_at;
+        p[f..f + 4].copy_from_slice(&d.vid_heap_function.to_le_bytes());
+        // The guest's own address, which means nothing in this process. What
+        // the host is given in its place is the whole point.
+        p[d.vid_heap.address_at..d.vid_heap.address_at + 8]
+            .copy_from_slice(&0x7fff_0000_0000u64.to_le_bytes());
+        p[d.vid_heap.limit_at..d.vid_heap.limit_at + 8]
+            .copy_from_slice(&(2 * TPAGE - 1).to_le_bytes());
+        p
+    }
+
+    /// The property the whole of M6 exists for: RM is handed an address that
+    /// reads back the guest's own pages, and never the guest's number.
+    #[test]
+    fn a_registration_reaches_the_host_as_the_guest_s_own_pages() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+
+        let p = heap_registration(&d, 0xc1d0_0001);
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &p,
+                &[(1024 * TPAGE, TPAGE), (0, TPAGE)],
+            ),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.calls().len(), 1, "the host was asked once");
+        assert_eq!(
+            host.seen(),
+            vec![
+                crate::guestmem::fake::mark(1024 * TPAGE),
+                crate::guestmem::fake::mark(0)
+            ],
+            "the host read the guest's pages, in the order the guest asked for"
+        );
+        assert_eq!(
+            be.registration_count(),
+            1,
+            "the span is held for the object"
+        );
+        be.teardown();
+    }
+
+    /// And the span goes when RM's object does.
+    #[test]
+    fn a_registration_is_released_when_its_object_is_freed() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+        let client = 0xc1d0_0001u32;
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, client),
+                &[(0, TPAGE), (TPAGE, TPAGE)],
+            ),
+            &mut resp,
+        );
+        assert_eq!(be.registration_count(), 1);
+
+        be.dispatch(
+            &ioctl_msg(h, 0x29, &free_params(client, host.handle)),
+            &mut resp,
+        );
+
+        assert_eq!(
+            be.registration_count(),
+            0,
+            "freeing the object released the guest memory it held"
+        );
+        be.teardown();
+    }
+
+    /// And on close, which is what catches one freed as some parent's child.
+    #[test]
+    fn a_registration_is_released_when_the_file_closes() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, 0xc1d0_0001),
+                &[(0, 2 * TPAGE)],
+            ),
+            &mut resp,
+        );
+        assert_eq!(be.registration_count(), 1);
+
+        be.dispatch(&hdr(MsgType::Close, h), &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(be.registration_count(), 0, "close released it");
+        be.teardown();
+    }
+
+    /// The refusal is still there for a guest that sends no runs. This is what
+    /// the three refusal tests above assert on a backend with no memory table
+    /// at all; here the table is there and the guest is the one that said
+    /// nothing, which is how a guest driver older than this backend behaves.
+    #[test]
+    fn a_registration_without_page_runs_is_still_refused() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, 0xc1d0_0001),
+            ),
+            &mut resp,
+        );
+
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = d.vid_heap_status_at;
+        assert_eq!(
+            u32::from_le_bytes(resp[body + st..body + st + 4].try_into().unwrap()),
+            0x56,
+            "NV_ERR_NOT_SUPPORTED"
+        );
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
+        assert_eq!(be.registration_count(), 0);
+        be.teardown();
+    }
+
+    /// A descriptor that is not a user virtual address is refused, however
+    /// well-formed the runs beside it are.
+    ///
+    /// This is the one that matters most on this route. RM answers a *virtual
+    /// address* here with NV_ERR_NOT_SUPPORTED on every Unix release
+    /// (`osmemdesc.c`, `case NVOS32_DESCRIPTOR_TYPE_VIRTUAL_ADDRESS`), so the
+    /// types it does serve are the other ones -- among them a file handle,
+    /// which a guest's number would resolve against whatever this backend has
+    /// open.
+    #[test]
+    fn a_descriptor_that_is_not_a_user_address_is_refused() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+
+        let mut refused = Vec::new();
+        for t in 0u32..8 {
+            let mut p = heap_registration(&d, 0xc1d0_0001);
+            let at = d.vid_heap.type_at;
+            p[at..at + 4].copy_from_slice(&t.to_le_bytes());
+
+            let before = host.calls().len();
+            let mut resp = vec![0u8; 4096];
+            be.dispatch(
+                &ioctl_msg_with_runs(
+                    h,
+                    abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                    &p,
+                    &[(0, TPAGE), (TPAGE, TPAGE)],
+                ),
+                &mut resp,
+            );
+            if host.calls().len() == before {
+                refused.push(t);
+            } else {
+                be.dispatch(
+                    &ioctl_msg(h, 0x29, &free_params(0xc1d0_0001, host.handle)),
+                    &mut resp,
+                );
+            }
+        }
+
+        let served: Vec<u32> = (0..8).filter(|t| !refused.contains(t)).collect();
+        assert_eq!(
+            served,
+            vec![d.virtual_address],
+            "only a user virtual address may be translated; every other descriptor type \
+             names something in this process"
+        );
+        be.teardown();
+    }
+
+    /// The registration and the free need not arrive on the same file.
+    ///
+    /// `NV_ESC_RM_ALLOC_MEMORY` is `NV_ACTUAL_DEVICE_ONLY` in NVIDIA's escape
+    /// layer, so a guest registers on `/dev/nvidia0` and frees on
+    /// `/dev/nvidiactl`. Keyed by the file, the free would never match and the
+    /// span would survive until close.
+    #[test]
+    fn a_registration_is_released_by_a_free_on_another_file() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, gpu) = backend_for_registration(&host);
+        let client = 0xc1d0_0001u32;
+        // A second file, as a guest that opened both nodes has.
+        let ctl = be.handles.insert(OwnedFd::from(
+            std::fs::File::open("/dev/null").expect("/dev/null"),
+        ));
+        be.handle_kinds.insert(ctl, DeviceKind::Ctl);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                gpu,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, client),
+                &[(0, TPAGE), (TPAGE, TPAGE)],
+            ),
+            &mut resp,
+        );
+        assert_eq!(be.registration_count(), 1);
+
+        be.dispatch(
+            &ioctl_msg(ctl, 0x29, &free_params(client, host.handle)),
+            &mut resp,
+        );
+        assert_eq!(
+            be.registration_count(),
+            0,
+            "a free on the control file released what the GPU file registered"
+        );
+        be.teardown();
+    }
+
+    /// Runs that do not add up to the length asked for are refused rather
+    /// than mapped short: RM would pin two pages and find one.
+    #[test]
+    fn runs_that_do_not_cover_the_length_are_refused() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                // Two pages asked for, one page described.
+                &heap_registration(&d, 0xc1d0_0001),
+                &[(0, TPAGE)],
+            ),
+            &mut resp,
+        );
+
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = d.vid_heap_status_at;
+        assert_eq!(
+            u32::from_le_bytes(resp[body + st..body + st + 4].try_into().unwrap()),
+            0x56
+        );
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
+        be.teardown();
+    }
+
     /// The other side of it. A heap call that allocates in the ordinary way is
     /// most of what this ioctl is for, and it still goes through -- a refusal
     /// that caught every function would have taken video memory with it.

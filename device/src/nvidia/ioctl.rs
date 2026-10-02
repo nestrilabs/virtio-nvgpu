@@ -246,7 +246,39 @@ impl NvidiaBackend {
     ) -> usize {
         let n = self.serve_ioctl(cookie, payload, resp_buf);
         self.note_clients(payload, &resp_buf[..n]);
+        self.note_registrations(payload, &resp_buf[..n]);
         n
+    }
+
+    /// Release the guest memory a freed object had registered.
+    ///
+    /// Separate from `note_clients`, and deliberately not restricted to the
+    /// control file: `NV_ESC_RM_ALLOC_MEMORY` is `NV_ACTUAL_DEVICE_ONLY` in
+    /// NVIDIA's escape layer, so a registration can be made on `/dev/nvidia0`
+    /// and freed on `/dev/nvidiactl`. Keyed on RM's handles, which say the
+    /// same thing on either file.
+    fn note_registrations(&mut self, payload: &[u8], resp: &[u8]) {
+        if self.registrations.is_empty() {
+            return;
+        }
+        let req = read_struct::<IoctlReq>(payload, 0);
+        let request = req.cmd as u64;
+        if (request >> 8) & 0xFF != b'F' as u64 || request & 0xFF != 0x29 {
+            return;
+        }
+        let head = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        if resp.len() < head || read_struct::<MsgHeader>(resp, 0).status != 0 {
+            return;
+        }
+        // NVOS00: hRoot, hObjectParent, hObjectOld, status.
+        let out = &resp[head..];
+        if out.len() < 16 {
+            return;
+        }
+        let word = |at: usize| u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+        if word(12) == NV_OK {
+            self.release_registrations(word(0), word(8));
+        }
     }
 
     /// Keep the record of which RM clients were made on which control file,
@@ -504,7 +536,9 @@ impl NvidiaBackend {
                 // The older of the two allocation escapes, and it carries its
                 // class inside the parameters rather than beside them.
                 if let Some(route) = self.registration_by_address(escape, None, param_in) {
-                    return self.refuse_registration(cookie, route, param_in, param_in, resp_buf);
+                    return self.serve_registration(
+                        cookie, host_fd, request, route, 0, param_in, deep_in, resp_buf,
+                    );
                 }
                 self.dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, resp_buf)
             }
@@ -575,7 +609,16 @@ impl NvidiaBackend {
                     // address space is its own. Here it is not.
                     let nested = &param_in[(ireq.data_len as usize).min(param_in.len())..];
                     if let Some(route) = self.registration_by_address(escape, Some(class), nested) {
-                        return self.refuse_registration(cookie, route, nested, param_in, resp_buf);
+                        return self.serve_registration(
+                            cookie,
+                            host_fd,
+                            request,
+                            route,
+                            ireq.data_len as usize,
+                            param_in,
+                            deep_in,
+                            resp_buf,
+                        );
                     }
                 }
                 self.dispatch_nested(
@@ -588,7 +631,9 @@ impl NvidiaBackend {
             // heap operations and go through as they always have.
             NV_ESC_RM_VID_HEAP_CONTROL => {
                 if let Some(route) = self.registration_by_address(escape, None, param_in) {
-                    return self.refuse_registration(cookie, route, param_in, param_in, resp_buf);
+                    return self.serve_registration(
+                        cookie, host_fd, request, route, 0, param_in, deep_in, resp_buf,
+                    );
                 }
                 self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf)
             }

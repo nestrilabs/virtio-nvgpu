@@ -226,6 +226,25 @@ pub struct NvidiaBackend {
     /// supplies it, and without it a registration by address has nowhere to
     /// find the guest's pages and is refused.
     guest_ram: Option<Box<dyn crate::guestmem::GuestRam>>,
+    /// How many registrations by address were served, and how many bytes they
+    /// covered at their peak. Reported at teardown beside whatever is left
+    /// over, which is the number that must be zero.
+    registrations_served: u64,
+    registrations_peak: usize,
+    /// Guest memory registered with RM by address, by the client and object
+    /// handle that own it. Holding the [`Stitched`] span is what keeps the
+    /// host mapping alive: RM pinned those pages for the life of the object,
+    /// so unmapping them earlier would leave RM pointing at nothing.
+    ///
+    /// Keyed by the RM handles and not by the file, because the two need not
+    /// be the same file: `NV_ESC_RM_ALLOC_MEMORY` is `NV_ACTUAL_DEVICE_ONLY`
+    /// and so arrives on `/dev/nvidia0`, while the `NV_ESC_RM_FREE` that ends
+    /// it goes to the control file. A client handle is unique within RM, so
+    /// the pair names the object on its own. The file is kept beside the span
+    /// only so that closing it releases what it registered.
+    ///
+    /// [`Stitched`]: crate::guestmem::Stitched
+    registrations: std::collections::HashMap<(u32, u32), (u64, crate::guestmem::Stitched)>,
     /// UVM files whose VA space was found to allow pageable access on a
     /// release with no flag to forbid it. The host file is initialised by the
     /// time the answer comes back, so the refusal attaches to the handle.
@@ -348,6 +367,9 @@ impl NvidiaBackend {
             uvm: None,
             osdesc: None,
             guest_ram: None,
+            registrations: std::collections::HashMap::new(),
+            registrations_served: 0,
+            registrations_peak: 0,
             uvm_denied: std::collections::HashSet::new(),
             allow_refused: std::collections::BTreeMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
@@ -526,6 +548,13 @@ impl NvidiaBackend {
         self.handles.len()
     }
 
+    /// How many registrations by address the guest is holding host mappings
+    /// for. A number that does not come back to zero is guest memory this
+    /// process keeps mapped after RM has let go of it.
+    pub fn registration_count(&self) -> usize {
+        self.registrations.len()
+    }
+
     /// Free bytes per SHM zone, as `(uc, wc, wb)`. For tests that assert a
     /// mapping cycle gives back exactly what it took.
     pub fn shm_free_bytes(&self) -> (u64, u64, u64) {
@@ -579,6 +608,21 @@ impl NvidiaBackend {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+        }
+        // Guest memory this process still has mapped after RM has been told to
+        // let go of it. Anything but zero is a leak of the guest's pages into
+        // the backend's address space, and the number is only visible here.
+        if self.registrations_served > 0 || !self.registrations.is_empty() {
+            let left = self.registrations.len();
+            let line = format!(
+                "NvidiaBackend::teardown: {} registration(s) by address, at most {} held at once, {left} still held",
+                self.registrations_served, self.registrations_peak,
+            );
+            if left == 0 {
+                log::info!("{line}");
+            } else {
+                log::warn!("{line} -- guest memory is still mapped here");
+            }
         }
         if !self.caps_refused.is_empty() {
             log::warn!(
