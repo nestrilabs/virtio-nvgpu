@@ -193,6 +193,12 @@ do_build() {
             cp target/$MUSL/release/\$b out/\$b
             strip out/\$b
         done
+        # The guest's Vulkan layer is loaded by the guest's glibc loader, so
+        # it is built for the host's own target, not musl.
+        cargo build --release -p nvgpu-vklayer --quiet >> out-build.log 2>&1 \\
+            || { grep -E '^error' -A12 out-build.log | head -n 60; exit 1; }
+        cp target/release/libVkLayer_nvgpu.so out/
+        strip out/libVkLayer_nvgpu.so
         ls -l out | tail -n +2
     "
     remote "$GPU_HOST" "mkdir -p '$GPU_BIN'"
@@ -201,6 +207,10 @@ do_build() {
         retry scp -3 -q "$BUILD_HOST:$BUILD_DIR/out/$b" "$GPU_HOST:$GPU_BIN/$b-$TAG"
         log "$b -> $GPU_HOST:$GPU_BIN/$b-$TAG"
     done
+    # Into the synced tree's guest directory, which box-stage copies whole.
+    retry scp -3 -q "$BUILD_HOST:$BUILD_DIR/out/libVkLayer_nvgpu.so" \
+        "$GPU_HOST:$GPU_DIR/scripts/rig/guest/libVkLayer_nvgpu.so"
+    log "libVkLayer_nvgpu.so -> $GPU_HOST:$GPU_DIR/scripts/rig/guest"
 }
 
 do_module() {

@@ -14,6 +14,13 @@ insmod /opt/nvgpu/virtio_gpu_nv.ko
 mkdir -p /mnt/nvidia && mount -t virtiofs nvidia /mnt/nvidia 2>/dev/null
 . /opt/nvgpu/guest-nvidia-env.sh
 nvgpu_env_check || echo "GUEST: continuing anyway so the failure is visible"
-VK_LOADER_DEBUG=error /opt/nvgpu/vkrt 2>&1 | sed '/^GUEST:/!s/^/GUEST: loader: /'
+# Twice: as an application sees it with the layer, and without, which is
+# what the driver itself does and what tells when the layer can go.
+for layer in on off; do
+    echo "GUEST: vkrt layer=$layer"
+    if [ $layer = on ]; then unset DISABLE_VK_LAYER_NVGPU_NO_UVM
+    else export DISABLE_VK_LAYER_NVGPU_NO_UVM=1; fi
+    VK_ADD_IMPLICIT_LAYER_PATH=/opt/nvgpu VK_LOADER_DEBUG=error /opt/nvgpu/vkrt 2>&1 | sed '/^GUEST:/!s/^/GUEST: loader: /'
+done
 echo "GUEST: DONE"
 sync; poweroff -f

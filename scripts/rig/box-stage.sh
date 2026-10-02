@@ -34,6 +34,9 @@ for c in "$GPU_DIR"/scripts/rig/guest/*.c; do
     esac || { echo "box-stage: $c did not build" >&2; exit 5; }
 done
 files=("$GPU_DIR/driver/virtio_gpu_nv.ko")
+# The guest Vulkan layer: the library comes from rig.sh build, the manifest
+# from the tree. A guest finds both through VK_ADD_IMPLICIT_LAYER_PATH.
+files+=("$GPU_DIR/vklayer/VkLayer_nvgpu.json")
 for f in "$GPU_DIR"/scripts/rig/guest/*; do
     [ -f "$f" ] && [ "${f%.c}" = "$f" ] && files+=("$f")
 done

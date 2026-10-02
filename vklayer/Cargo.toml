@@ -1,0 +1,9 @@
+[package]
+name = "nvgpu-vklayer"
+version.workspace = true
+edition.workspace = true
+description = "Guest Vulkan layer: hides the extensions NVIDIA's driver offers but cannot create without UVM"
+
+[lib]
+name = "VkLayer_nvgpu"
+crate-type = ["cdylib", "rlib"]
