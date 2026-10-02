@@ -110,14 +110,18 @@ pub(super) fn plan(
             return Err(NV_ERR_NOT_SUPPORTED);
         }
 
-        if p.copy_in {
-            // More bytes than the length says means the guest and this table
-            // disagree about the layout, which is not something to resolve by
-            // taking the smaller number.
-            if let Some(bytes) = sent(segs, legacy, p.ptr_offset)
-                && bytes.len() > len
-            {
-                return Err(NV_ERR_NOT_SUPPORTED);
+        if p.copy_in && len > 0 {
+            // The guest derives this length from the same count in the same
+            // field of the same block, so the two halves agree exactly or they
+            // disagree about the layout -- and a length read from a different
+            // place is not something to resolve by taking the smaller number.
+            // Fewer bytes than RM will read used to be zero-filled here, which
+            // is safe for this process and gives the caller an answer computed
+            // from data it never sent.
+            match sent(segs, legacy, p.ptr_offset) {
+                Some(bytes) if bytes.len() == len => {}
+                Some(_) => return Err(NV_ERR_NOT_SUPPORTED),
+                None => return Err(NV_ERR_NOT_SUPPORTED),
             }
         }
 
@@ -183,21 +187,11 @@ impl<'a> Embedded<'a> {
             let mut buf = GuardPool::lease(pool, slot.len.max(1)).ok_or(NV_ERR_NO_MEMORY)?;
             buf.as_mut_slice().fill(0);
 
-            if slot.copy_in {
-                if let Some(bytes) = sent(segs, legacy, slot.ptr_offset) {
-                    // `plan` refused anything longer than the slot.
-                    buf.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-                } else if slot.len > 0 {
-                    // The guest never sent the bytes: an older guest, or one
-                    // that does not describe this pointer. RM reads zeroes
-                    // rather than the guest's data, which is wrong for the
-                    // caller and safe for this process.
-                    log::debug!(
-                        "RM_CONTROL: no segment for the pointer at {}, {} bytes read as zero",
-                        slot.ptr_offset,
-                        slot.len
-                    );
-                }
+            if slot.copy_in
+                && let Some(bytes) = sent(segs, legacy, slot.ptr_offset)
+            {
+                // `plan` refused any length but this one.
+                buf.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
             }
 
             let saved: [u8; 8] = params[slot.ptr_offset..slot.ptr_offset + 8]
@@ -252,6 +246,11 @@ mod tests {
         }
     }
 
+    /// The wire form of some segments, as a guest sends them.
+    fn wire(buf: &mut [u8], segments: &[(u32, &[u8])]) -> usize {
+        protocol::segments::encode(buf, segments).expect("encodes")
+    }
+
     static LIST: &[EmbeddedPtr] = &[EmbeddedPtr {
         ptr_offset: 8,
         count: Count::Field {
@@ -267,8 +266,11 @@ mod tests {
     fn a_length_comes_from_the_count_the_guest_sent() {
         let e = entry(LIST, 16);
         let p = block(16, 3, 8);
+        let mut w = [0u8; 128];
+        let n = wire(&mut w, &[(8, &[0u8; 24])]);
+        let s = Segments::parse(&w[..n]).unwrap();
         assert_eq!(
-            plan(&e, &p, None, None).unwrap(),
+            plan(&e, &p, Some(s), None).unwrap(),
             vec![Slot {
                 ptr_offset: 8,
                 len: 24,
@@ -347,8 +349,11 @@ mod tests {
         let e = entry(TWO, 32);
         let mut p = block(32, 10, 8);
         p[24..32].copy_from_slice(&0xcafe_u64.to_le_bytes());
+        let mut w = [0u8; 128];
+        let n = wire(&mut w, &[(8, &[1u8; 10])]);
+        let s = Segments::parse(&w[..n]).unwrap();
 
-        let slots = plan(&e, &p, None, None).unwrap();
+        let slots = plan(&e, &p, Some(s), None).unwrap();
         assert_eq!(slots.len(), 2);
         assert_eq!(slots[0].len, 10);
         assert!(slots[0].copy_in && !slots[0].copy_out);
@@ -363,9 +368,11 @@ mod tests {
         let mut p = block(16, 2, 8);
         let guest = p[8..16].to_vec();
 
-        let mut wire = [0u8; 64];
-        let n = protocol::segments::encode(&mut wire, &[(8, &[1u8, 2, 3, 4])]).unwrap();
-        let s = Segments::parse(&wire[..n]).unwrap();
+        let mut w = [0u8; 64];
+        let mut want = [0u8; 16];
+        want[..4].copy_from_slice(&[1, 2, 3, 4]);
+        let n = wire(&mut w, &[(8, &want)]);
+        let s = Segments::parse(&w[..n]).unwrap();
 
         let slots = plan(&e, &p, Some(s), None).unwrap();
         let emb = Embedded::install(&slots, &mut p, Some(s), None, &pool).unwrap();
@@ -393,19 +400,35 @@ mod tests {
         let pool = std::cell::RefCell::new(GuardPool::default());
         let e = entry(LIST, 16);
         let mut p = block(16, 2, 8);
-        let guest_bytes = [5u8, 6, 7, 8];
+        let mut guest_bytes = [0u8; 16];
+        guest_bytes[..4].copy_from_slice(&[5, 6, 7, 8]);
 
         let slots = plan(&e, &p, None, Some((8, &guest_bytes))).unwrap();
         assert_eq!(slots[0].len, 16);
         let emb = Embedded::install(&slots, &mut p, None, Some((8, &guest_bytes)), &pool).unwrap();
-        assert_eq!(&emb.reply()[0].1[..4], &guest_bytes);
+        assert_eq!(&emb.reply()[0].1[..4], &[5, 6, 7, 8]);
 
-        // Bytes offered for a pointer the control does not have are ignored.
-        let mut p2 = block(16, 2, 8);
-        let slots = plan(&e, &p2, None, Some((999, &guest_bytes))).unwrap();
-        let emb =
-            Embedded::install(&slots, &mut p2, None, Some((999, &guest_bytes)), &pool).unwrap();
-        assert_eq!(emb.reply()[0].1, &[0u8; 16]);
+        // Bytes offered for a pointer the control does not have are not bytes
+        // for the pointer it does have: the call is refused rather than served
+        // with zeroes where RM reads.
+        let p2 = block(16, 2, 8);
+        assert_eq!(
+            plan(&e, &p2, None, Some((999, &guest_bytes))),
+            Err(NV_ERR_NOT_SUPPORTED)
+        );
+    }
+
+    /// Short, or missing altogether. Both used to be zero-filled, which gave
+    /// the caller an answer RM computed from data the guest never sent.
+    #[test]
+    fn a_segment_the_count_does_not_match_is_refused() {
+        let e = entry(LIST, 16);
+        let p = block(16, 2, 8);
+        let mut w = [0u8; 64];
+        let n = wire(&mut w, &[(8, &[7u8; 8])]);
+        let s = Segments::parse(&w[..n]).unwrap();
+        assert_eq!(plan(&e, &p, Some(s), None), Err(NV_ERR_NOT_SUPPORTED));
+        assert_eq!(plan(&e, &p, None, None), Err(NV_ERR_NOT_SUPPORTED));
     }
 
     #[test]

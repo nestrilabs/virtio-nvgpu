@@ -255,12 +255,43 @@ impl NvidiaBackend {
                     .then(|| protocol::segments::Segments::parse(bytes))
                     .flatten()
             });
+            // A control this release's table describes. When the table is an
+            // older release's, a control *any* release describes and this one
+            // does not is refused: a newer release can copy through a pointer
+            // the older table is silent about, and silence is not a reading.
+            let mut drift_refusal = None;
             let described = if escape == 0x2a && outer.len() >= NVOS54_CMD + 4 {
                 let cmd = u32::from_le_bytes(outer[NVOS54_CMD..NVOS54_CMD + 4].try_into().unwrap());
-                self.rmctrl.and_then(|t| abi::rmctrl::lookup(t, cmd))
+                let found = self
+                    .rmctrl
+                    .and_then(|sel| abi::rmctrl::lookup(sel.table, cmd));
+                if found.is_none()
+                    && self.rmctrl.is_some_and(|sel| !sel.exact)
+                    && abi::rmctrl::in_any_table(cmd)
+                {
+                    log::warn!(
+                        "RM_CONTROL cmd={cmd:#010x}: another release describes a pointer in it \
+                         and this host's table does not; refused"
+                    );
+                    drift_refusal = Some(rmctrl::NV_ERR_NOT_SUPPORTED);
+                }
+                found
             } else {
                 None
             };
+
+            if let Some(status) = drift_refusal {
+                if outer.len() >= NVOS54_TOTAL {
+                    outer[NVOS54_STATUS..NVOS54_STATUS + 4].copy_from_slice(&status.to_le_bytes());
+                }
+                outer[ptr_offset..ptr_offset + 8].copy_from_slice(&caller_ptr);
+                if let Some(saved) = rights {
+                    outer[NVOS64_RIGHTS..NVOS64_RIGHTS + 8].copy_from_slice(&saved);
+                }
+                let mut combined = outer;
+                combined.extend_from_slice(host_buf);
+                return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0);
+            }
             // A guest from v0.1 describes one pointer in the request struct
             // instead of sending a segment table. It is read as the segment it
             // is, so a backend ahead of the module in a rootfs still serves

@@ -226,9 +226,9 @@ pub struct NvidiaBackend {
     /// ABI profile selected for `driver`, if one exists.
     abi: Option<&'static [abi::versions::IoctlEntry]>,
     /// The RM controls whose parameters carry a pointer RM dereferences, for
-    /// `driver`. `None` until the release is known, and a control is only
-    /// forwarded with a pointer in it when this says it holds none.
-    rmctrl: Option<&'static [abi::rmctrl::RmCtrlEntry]>,
+    /// `driver`, and whether the table is this release's own. `None` until the
+    /// release is known; the backend refuses to start without one.
+    rmctrl: Option<abi::rmctrl::Selected>,
     /// Where device memory is placed so the guest can address it. `None` until
     /// the transport supplies one, and without it a mapping can be made on the
     /// host but never reached from the guest.
@@ -396,17 +396,27 @@ impl NvidiaBackend {
         };
         self.driver = Some(v);
         self.abi = Some(t);
-        // No table for the release means no control can be checked for
-        // embedded pointers, and `dispatch_nested` then forwards none of them.
-        self.rmctrl = abi::rmctrl::table_for(v);
-        match self.rmctrl {
-            Some(r) => log::info!(
-                "host driver {v}: {} RM controls carry a pointer RM dereferences",
-                r.len()
-            ),
-            None => log::warn!(
-                "host driver {v}: no RM pointer table; every control that carries one is refused"
-            ),
+        // Without a table nothing can be said about which controls carry a
+        // pointer RM dereferences, and the backend would forward all of them.
+        // It refuses to start instead. Unreachable as things are -- the tables
+        // and the ABI profiles start at the same release -- which is the
+        // reason to state it here rather than discover it later.
+        let Some(sel) = abi::rmctrl::select(v) else {
+            return Err(format!("host driver {v} has no RM pointer table"));
+        };
+        self.rmctrl = Some(sel);
+        log::info!(
+            "host driver {v}: {} RM controls carry a pointer RM dereferences",
+            sel.table.len()
+        );
+        if !sel.exact {
+            // The table is an older release's. It cannot describe a control
+            // this release added, so a control any release describes and this
+            // table does not is refused rather than forwarded.
+            log::warn!(
+                "host driver {v} has no RM pointer table of its own; using an older release's, \
+                 and refusing every control another release describes that it does not"
+            );
         }
         log::info!("host driver {v}: ABI profile selected, {} escapes", t.len());
         Ok(())

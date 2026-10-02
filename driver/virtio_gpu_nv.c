@@ -378,6 +378,16 @@ MODULE_PARM_DESC(poll_events, "a wait on a device descriptor really waits");
  * Kept as a knob because it is the obvious thing to try, and a number beats
  * trying it again.
  */
+/*
+ * Microseconds a caller spins on the control queue for its answer before
+ * sleeping. An answer that comes back inside the spin skips the interrupt's
+ * wake-up and the scheduler, which is most of a forwarded call's cost when
+ * the host answers in a few microseconds. 0, the default, never spins.
+ */
+static int nvgpu_rpc_spin_us;
+module_param_named(rpc_spin_us, nvgpu_rpc_spin_us, int, 0644);
+MODULE_PARM_DESC(rpc_spin_us, "microseconds to spin for a control-queue answer before sleeping");
+
 static int nvgpu_poll_spin_us;
 module_param_named(poll_spin_us, nvgpu_poll_spin_us, int, 0644);
 MODULE_PARM_DESC(poll_spin_us, "microseconds to spin before sleeping for an event");
@@ -1145,6 +1155,31 @@ static long nvgpu_dri_ioctl(struct file *filp, unsigned int cmd,
 
 /* ───────── Virtqueue communication ───────── */
 
+static void nvgpu_ctrl_drain(struct nvgpu_device *dev);
+
+/*
+ * Wait for `done` by reading the used ring ourselves, for at most `us`.
+ *
+ * The interrupt is left on, so a caller that gives up and sleeps, or any other
+ * caller already asleep, is still woken the ordinary way. Every pass takes
+ * vq_lock, as the interrupt does, so the two cannot take one answer twice.
+ */
+static void nvgpu_ctrl_spin(struct nvgpu_device *dev, struct completion *done,
+                            int us) {
+  ktime_t deadline = ktime_add_us(ktime_get(), us);
+  unsigned long flags;
+
+  while (!completion_done(done)) {
+    spin_lock_irqsave(&dev->vq_lock, flags);
+    nvgpu_ctrl_drain(dev);
+    spin_unlock_irqrestore(&dev->vq_lock, flags);
+    if (completion_done(done) || ktime_after(ktime_get(), deadline) ||
+        need_resched() || signal_pending(current))
+      break;
+    cpu_relax();
+  }
+}
+
 /*
  * One request in flight on the control queue.
  *
@@ -1206,6 +1241,9 @@ static int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
   if (notify)
     virtqueue_notify(dev->ctrl_vq);
 
+  if (nvgpu_rpc_spin_us > 0)
+    nvgpu_ctrl_spin(dev, &r->done, nvgpu_rpc_spin_us);
+
   left = wait_for_completion_killable_timeout(&r->done, 10 * HZ);
 
   spin_lock_irqsave(&dev->vq_lock, flags);
@@ -1222,15 +1260,15 @@ static int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
   return 0;
 }
 
-/* Virtqueue callback: the VMM has answered one or more requests. */
-static void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
-  struct nvgpu_device *dev = vq->vdev->priv;
+/*
+ * Take every answered request off the control queue and wake its caller.
+ * Called with vq_lock held, from the interrupt and from a spinning caller.
+ */
+static void nvgpu_ctrl_drain(struct nvgpu_device *dev) {
   struct nvgpu_req *r;
-  unsigned long flags;
   unsigned int len;
 
-  spin_lock_irqsave(&dev->vq_lock, flags);
-  while ((r = virtqueue_get_buf(vq, &len)) != NULL) {
+  while ((r = virtqueue_get_buf(dev->ctrl_vq, &len)) != NULL) {
     if (r->abandoned) {
       kfree(r);
       continue;
@@ -1238,6 +1276,15 @@ static void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
     r->written = len;
     complete(&r->done);
   }
+}
+
+/* Virtqueue callback: the VMM has answered one or more requests. */
+static void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
+  struct nvgpu_device *dev = vq->vdev->priv;
+  unsigned long flags;
+
+  spin_lock_irqsave(&dev->vq_lock, flags);
+  nvgpu_ctrl_drain(dev);
   spin_unlock_irqrestore(&dev->vq_lock, flags);
 }
 

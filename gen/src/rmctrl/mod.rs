@@ -156,18 +156,50 @@ static PROFILES: &[Profile] = &[
     },
 ];
 
+/// A table, and whether it is the host release's own.
+#[derive(Clone, Copy)]
+pub struct Selected {
+    pub table: &'static [RmCtrlEntry],
+    /// The host release has a table of its own. When false the table is an
+    /// older release's, and what it says about a newer release's controls is
+    /// an assumption rather than a reading.
+    pub exact: bool,
+}
+
 /// The table for a host driver version: its own, or the nearest older one.
 ///
-/// Nearest-older is what the ioctl tables do, and it is safe here for the same
-/// reason it is not safe for UVM: every number this table supplies is checked
-/// against the parameter block the guest actually sent before it is used, and a
-/// count that does not fit refuses the call rather than sizing a buffer.
-pub fn table_for(v: DriverVersion) -> Option<&'static [RmCtrlEntry]> {
+/// Nearest-older is what the ioctl tables do, and every number a table
+/// supplies is checked against the block the guest actually sent before it is
+/// used. What nearest-older cannot do is describe a control a *newer* release
+/// added: releases differ by five or six controls across the five tables here,
+/// so a host between two of them -- or newer than all of them -- can carry a
+/// pointer in a control the selected table says nothing about. `exact` says
+/// which case this is, and the caller refuses what it cannot vouch for; see
+/// [`in_any_table`].
+pub fn select(v: DriverVersion) -> Option<Selected> {
     PROFILES
         .iter()
         .rev()
         .find(|p| p.version <= v)
-        .map(|p| (p.table)())
+        .map(|p| Selected {
+            table: (p.table)(),
+            exact: p.version == v,
+        })
+}
+
+/// As [`select`], for callers that only want the table.
+pub fn table_for(v: DriverVersion) -> Option<&'static [RmCtrlEntry]> {
+    select(v).map(|s| s.table)
+}
+
+/// Whether any release here describes this control as carrying a pointer.
+///
+/// The question a backend asks when its table is not the host's own: a
+/// control some release copies through is one this release may copy through
+/// too, and forwarding it on the strength of an older table's silence is the
+/// one thing this module exists to prevent.
+pub fn in_any_table(cmd: u32) -> bool {
+    PROFILES.iter().any(|p| lookup((p.table)(), cmd).is_some())
 }
 
 /// Look up one control. The tables are sorted by `cmd`, so this is a search.
@@ -312,6 +344,38 @@ mod tests {
             let e = lookup(t, 0x2080_1336).expect("FB_GET_AMAP_CONF is in every table");
             assert!(e.refuse, "{v}");
         }
+    }
+
+    /// The releases here differ by five or six controls, so this is the case
+    /// a host between two tables lands in.
+    #[test]
+    fn a_control_another_release_describes_is_known_to_be_one() {
+        // 0x00801b01 is described by 615 and by no older table.
+        assert!(in_any_table(0x0080_1b01));
+        let older = table_for(DriverVersion::new(595, 104, 2)).expect("595.104.02 has a table");
+        assert!(lookup(older, 0x0080_1b01).is_none());
+
+        // Something no release describes stays unknown.
+        assert!(!in_any_table(0xdead_beef));
+    }
+
+    #[test]
+    fn exactness_is_reported_so_a_fallback_can_be_treated_differently() {
+        assert!(
+            select(DriverVersion::new(615, 71, 9))
+                .expect("has one")
+                .exact
+        );
+        assert!(
+            !select(DriverVersion::new(600, 0, 0))
+                .expect("falls back")
+                .exact
+        );
+        assert!(
+            !select(DriverVersion::new(700, 0, 0))
+                .expect("falls back")
+                .exact
+        );
     }
 
     #[test]

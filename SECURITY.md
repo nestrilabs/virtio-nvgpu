@@ -42,7 +42,17 @@ These hold on this branch.
 | UVM tools | `nvidia-uvm-tools`, under every capability |
 | UVM init | the guest's UVM_INITIALIZE flags; the backend sends its own, with HMM off and sharing mode on, and pageable access off where the release has the flag |
 | embedded pointers | a guest address in a pointer RM dereferences inside an RM control's parameters: the backend supplies every such buffer itself, sized from the count in the guest's own block and bounded at 1 MiB per pointer and 2 MiB per call |
+| allocation rights | `NVOS64.pRightsRequested`, a pointer RM dereferences when it is not null; the host sees null and the caller gets its own value back |
+| release drift | on a host with no pointer table of its own, every control any release describes a pointer in that the selected table does not; the backend does not start when no table covers the release at all |
+| half-sent buffers | a control whose pointer RM reads and whose bytes the guest did not send, or sent a different number of; refused rather than served with zeroes |
 | undescribed controls | a control whose embedded pointers the generated table cannot describe, including one RM compiles in only under a build flag; refused with NV_ERR_NOT_SUPPORTED |
+
+The embedded-pointer rows hold for a host release with a table of its own
+(535.129.03, 580.178.04, 595.71.05, 595.104.02, 615.71.09) and for one between
+two of them or newer than all of them. In the second case the table is an older
+release's, which cannot describe a control a newer release added, so a control
+any release describes and that table does not is refused. Adding a release is
+one generator run.
 
 There is no command-line flag that switches any of these off.
 

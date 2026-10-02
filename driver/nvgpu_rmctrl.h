@@ -99,8 +99,10 @@ static const struct nvgpu_rmctrl_table nvgpu_rmctrl_tables[] = {
  *
  * Its own, or the nearest older one, as the backend does. NULL when the
  * release is older than every table, or the version string is not one.
- * Nothing is guessed from a missing table: the driver then sends no segments,
- * and the backend refuses every control that carries a pointer.
+ * Nothing is guessed from a missing table: the driver sends no segments, and
+ * the backend, which requires a segment for every pointer RM reads, refuses
+ * the control. A control whose pointers are all null needs no segment and is
+ * served either way, which is right -- there is nothing to copy.
  */
 static inline const struct nvgpu_rmctrl_table *
 nvgpu_rmctrl_table_for(const char *version)
