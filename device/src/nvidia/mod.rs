@@ -225,6 +225,10 @@ pub struct NvidiaBackend {
     driver: Option<abi::version::DriverVersion>,
     /// ABI profile selected for `driver`, if one exists.
     abi: Option<&'static [abi::versions::IoctlEntry]>,
+    /// The RM controls whose parameters carry a pointer RM dereferences, for
+    /// `driver`. `None` until the release is known, and a control is only
+    /// forwarded with a pointer in it when this says it holds none.
+    rmctrl: Option<&'static [abi::rmctrl::RmCtrlEntry]>,
     /// Where device memory is placed so the guest can address it. `None` until
     /// the transport supplies one, and without it a mapping can be made on the
     /// host but never reached from the guest.
@@ -322,6 +326,7 @@ impl NvidiaBackend {
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             guards: Default::default(),
+            rmctrl: None,
             caps: crate::caps::Caps::DEFAULT,
             caps_refused: std::collections::BTreeMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
@@ -391,6 +396,18 @@ impl NvidiaBackend {
         };
         self.driver = Some(v);
         self.abi = Some(t);
+        // No table for the release means no control can be checked for
+        // embedded pointers, and `dispatch_nested` then forwards none of them.
+        self.rmctrl = abi::rmctrl::table_for(v);
+        match self.rmctrl {
+            Some(r) => log::info!(
+                "host driver {v}: {} RM controls carry a pointer RM dereferences",
+                r.len()
+            ),
+            None => log::warn!(
+                "host driver {v}: no RM pointer table; every control that carries one is refused"
+            ),
+        }
         log::info!("host driver {v}: ABI profile selected, {} escapes", t.len());
         Ok(())
     }
@@ -660,6 +677,7 @@ mod nested;
 mod open;
 mod resp;
 mod rm_fd;
+mod rmctrl;
 mod simple;
 mod window;
 

@@ -16,5 +16,6 @@
 #![no_std]
 
 pub mod messages;
+pub mod segments;
 
 pub use messages::*;

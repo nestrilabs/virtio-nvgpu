@@ -223,6 +223,69 @@ impl NvidiaBackend {
             // separate mmap operations.
             // ---------------------------------------------------------------
 
+            // Pointers RM dereferences inside the parameter block.
+            //
+            // For the controls `abi::rmctrl` describes, nothing a guest put in
+            // a pointer field is forwarded: the length comes from the count in
+            // the guest's own block, the buffer is this process's, and the
+            // guest's value goes back into the field before the reply. The
+            // bytes a guest wants read travel as segments of the deep block.
+            // See `rmctrl.rs`.
+            let segs = deep_in.and_then(|(off, bytes)| {
+                (off as u32 == protocol::segments::SEGMENTED)
+                    .then(|| protocol::segments::Segments::parse(bytes))
+                    .flatten()
+            });
+            let described = if escape == 0x2a && outer.len() >= NVOS54_CMD + 4 {
+                let cmd = u32::from_le_bytes(outer[NVOS54_CMD..NVOS54_CMD + 4].try_into().unwrap());
+                self.rmctrl.and_then(|t| abi::rmctrl::lookup(t, cmd))
+            } else {
+                None
+            };
+            let mut embedded: Option<rmctrl::Embedded> = None;
+            if let Some(entry) = described {
+                let have = deep_in.map(|(_, b)| b.len()).unwrap_or(0);
+                let refused = match rmctrl::plan(entry, host_buf, segs) {
+                    Err(status) => Some(status),
+                    Ok(slots) if !rmctrl::reply_fits(&slots, have) => {
+                        log::warn!(
+                            "RM_CONTROL cmd={:#010x}: the guest left {have} bytes for what RM \
+                             writes back, which does not hold it",
+                            entry.cmd
+                        );
+                        Some(rmctrl::NV_ERR_NOT_SUPPORTED)
+                    }
+                    Ok(slots) => {
+                        match rmctrl::Embedded::install(&slots, host_buf, segs, &self.guards) {
+                            Ok(e) => {
+                                embedded = Some(e);
+                                None
+                            }
+                            Err(status) => Some(status),
+                        }
+                    }
+                };
+                if let Some(status) = refused {
+                    // RM's own refusal, in the status word of the parameter
+                    // block, with the ioctl itself succeeding. An errno here
+                    // reads to a driver as the call never having happened, and
+                    // it retries or hangs rather than doing without the
+                    // feature (fork gotcha 6).
+                    log::warn!(
+                        "RM_CONTROL cmd={:#010x}: refused, status={status:#x}",
+                        entry.cmd
+                    );
+                    if outer.len() >= NVOS54_TOTAL {
+                        outer[NVOS54_STATUS..NVOS54_STATUS + 4]
+                            .copy_from_slice(&status.to_le_bytes());
+                    }
+                    outer[ptr_offset..ptr_offset + 8].copy_from_slice(&caller_ptr);
+                    let mut combined = outer;
+                    combined.extend_from_slice(host_buf);
+                    return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, 0);
+                }
+            }
+
             // Give the pointer inside the nested block a host address.
             //
             // The buffer has to outlive the call, and the guest's own pointer
@@ -231,7 +294,8 @@ impl NvidiaBackend {
             // meaningless and a leak of our layout.
             let mut deep_buf: Vec<u8> = Vec::new();
             let mut deep_saved: Option<(usize, [u8; 8])> = None;
-            if let Some((ptr_off, bytes)) = deep_in {
+            if let Some((ptr_off, bytes)) = deep_in.filter(|_| embedded.is_none() && segs.is_none())
+            {
                 if ptr_off + 8 > host_buf.len() {
                     log::warn!(
                         "ioctl {request:#x}: pointer at {ptr_off} is outside {} nested bytes",
@@ -347,7 +411,28 @@ impl NvidiaBackend {
                 host_buf[ptr_off..ptr_off + 8].copy_from_slice(&guest_ptr);
             }
             // Only what the guest allocated room for goes back, not the pad.
-            let deep_reply = deep_in.map(|(_, b)| b.len()).unwrap_or(0);
+            let mut deep_reply = deep_in.map(|(_, b)| b.len()).unwrap_or(0);
+
+            // Each buffer RM wrote goes back as its own segment, at the offset
+            // of the pointer that named it, so the guest driver can put each
+            // one where its caller's own pointer addresses.
+            if let Some(e) = &embedded {
+                e.restore(host_buf);
+                let out = e.reply();
+                if out.is_empty() {
+                    deep_reply = 0;
+                } else {
+                    deep_buf = vec![0u8; deep_reply];
+                    if protocol::segments::encode(&mut deep_buf, &out).is_none() {
+                        // `reply_fits` said it would. Send an empty table
+                        // rather than a partial one: the guest then copies
+                        // nothing back, instead of copying something shaped
+                        // like an answer.
+                        log::error!("RM_CONTROL: {} bytes did not hold the reply", deep_reply);
+                        deep_buf.fill(0);
+                    }
+                }
+            }
             let mut combined = outer;
             combined.extend_from_slice(&host_buf);
             combined.extend_from_slice(&deep_buf[..deep_reply]);

@@ -27,8 +27,8 @@
 
 pub mod v535_129_03;
 pub mod v580_178_04;
-pub mod v595_71_05;
 pub mod v595_104_02;
+pub mod v595_71_05;
 pub mod v615_71_09;
 
 use crate::version::DriverVersion;
@@ -265,7 +265,13 @@ mod tests {
         let p = e.ptrs[0];
         assert_eq!(p.ptr_offset, 8);
         assert_eq!(p.elem_size, 8);
-        assert_eq!(p.count, Count::Field { offset: 0, width: 4 });
+        assert_eq!(
+            p.count,
+            Count::Field {
+                offset: 0,
+                width: 4
+            }
+        );
 
         // Three entries, as the leading count says.
         let mut params = vec![0u8; e.params_size];
