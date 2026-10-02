@@ -40,7 +40,8 @@ use virtio_bindings::bindings::virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::QueueOwnedT;
 use vm_memory::{
-    Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
+    Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend,
+    GuestMemoryLoadGuard, GuestMemoryMmap, GuestMemoryRegion,
 };
 
 /// The driver calls `virtio_find_vqs(vdev, 2, ...)` and fails probe on the
@@ -78,6 +79,36 @@ struct Args {
 /// The VMM owns the window's address space and the memory slot that describes
 /// it, so it is the only process whose `MAP_FIXED` the guest can see. This
 /// hands the descriptor over and lets it do the placement.
+/// Guest RAM, as the backend can map from it.
+///
+/// A vhost-user frontend sends each region as a file descriptor, and
+/// `vhost-user-backend` builds every region with `MmapRegion::from_file`, so
+/// the fd and the offset within it survive into here. That is what makes a
+/// host address aliasing a guest's own pages possible at all; without the fd
+/// there would be only this process's mapping, which cannot be re-mapped
+/// somewhere else.
+///
+/// Holds the atomic handle rather than a snapshot, so a memory table replaced
+/// after this was built is seen rather than silently stale.
+struct VhostGuestRam(GuestMemoryAtomic<GuestMemoryMmap>);
+
+impl device::guestmem::GuestRam for VhostGuestRam {
+    fn backing(&self, gpa: u64) -> Option<device::guestmem::Backing> {
+        let mem = self.0.memory();
+        let region = mem.find_region(GuestAddress(gpa))?;
+        // A region the frontend sent without a descriptor cannot be mapped
+        // from, only read through. None has been seen, and a registration is
+        // refused rather than served from a mapping we cannot alias.
+        let file = region.file_offset()?;
+        let within = gpa.checked_sub(region.start_addr().raw_value())?;
+        Some(device::guestmem::Backing {
+            fd: file.file().try_clone().ok()?.into(),
+            offset: file.start().checked_add(within)?,
+            len: region.len().checked_sub(within)?,
+        })
+    }
+}
+
 struct VhostWindow(Backend);
 
 impl WindowPlacer for VhostWindow {
@@ -518,6 +549,13 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn update_memory(&mut self, mem: GuestMemoryAtomic<GuestMemoryMmap>) -> std::io::Result<()> {
+        // Also the backend's, so memory a guest registers by CPU address can
+        // be found. The handle is atomic, so a later table replaces what this
+        // one sees rather than leaving the backend on a stale set of regions.
+        self.nvidia
+            .lock()
+            .unwrap()
+            .set_guest_ram(Box::new(VhostGuestRam(mem.clone())));
         self.mem = Some(mem);
         Ok(())
     }

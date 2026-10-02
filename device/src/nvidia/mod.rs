@@ -222,6 +222,10 @@ pub struct NvidiaBackend {
     /// is known, and until then those routes are not recognised -- which is
     /// why nothing is served before a release is known at all.
     osdesc: Option<abi::osdesc::OsDesc>,
+    /// Guest RAM, as something to map from. `None` until the transport
+    /// supplies it, and without it a registration by address has nowhere to
+    /// find the guest's pages and is refused.
+    guest_ram: Option<Box<dyn crate::guestmem::GuestRam>>,
     /// UVM files whose VA space was found to allow pageable access on a
     /// release with no flag to forbid it. The host file is initialised by the
     /// time the answer comes back, so the refusal attaches to the handle.
@@ -343,6 +347,7 @@ impl NvidiaBackend {
             rmallow: None,
             uvm: None,
             osdesc: None,
+            guest_ram: None,
             uvm_denied: std::collections::HashSet::new(),
             allow_refused: std::collections::BTreeMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
@@ -505,6 +510,15 @@ impl NvidiaBackend {
     /// there is no address in the guest that names it.
     pub fn set_window(&mut self, placer: Box<dyn crate::shm::WindowPlacer>) {
         self.window = Some(placer);
+    }
+
+    /// Guest RAM, from the transport, which is the only part that has it.
+    ///
+    /// Without it the backend cannot build a host address out of a guest's
+    /// pages, so memory registered by CPU address stays refused -- which is
+    /// what it is in a backend that has no transport at all.
+    pub fn set_guest_ram(&mut self, ram: Box<dyn crate::guestmem::GuestRam>) {
+        self.guest_ram = Some(ram);
     }
 
     /// How many host descriptors the guest currently holds open.
