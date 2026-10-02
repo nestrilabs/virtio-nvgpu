@@ -608,6 +608,60 @@ mod tests {
         assert!(host.calls().is_empty(), "{:x?}", host.calls());
     }
 
+    /// The guest driver has to know how many bytes of allocation parameters
+    /// to copy before it can forward anything, and `paramsSize` is usually
+    /// zero, so it used a table compiled into the module. That table was
+    /// generated from 595.58.03 and the host here runs 615.71.09, which added
+    /// two words to NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS -- so the guest
+    /// forwarded 20 bytes of a 28-byte struct and RM read the other eight from
+    /// past the end of the buffer. The backend knows the host's release, so it
+    /// sends the sizes and the guest stops guessing.
+    #[test]
+    fn the_guest_is_told_what_rm_sizes_an_allocation_at() {
+        let host = CountingHost::default();
+        let (mut be, _h) = backend_on(&host);
+        let mut buf = vec![0u8; 8192];
+        let n = be.write_alloc_size_section(&mut buf);
+        assert!(n >= 8, "the section was not written");
+
+        let word = |i: usize| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(word(0), NvidiaBackend::ALLOC_SIZE_MAGIC);
+        let count = word(1) as usize;
+        assert_eq!(n, 8 + count * 8);
+
+        let sizes: std::collections::BTreeMap<u32, u32> = (0..count)
+            .map(|i| (word(2 + i * 2), word(3 + i * 2)))
+            .collect();
+
+        // The two the probe runs caught, at RM's size for 615.71.09 rather
+        // than the 20 and 368 the module was built with.
+        assert_eq!(sizes.get(&0xa06c), Some(&28), "KEPLER_CHANNEL_GROUP_A");
+        assert_eq!(sizes.get(&0xc56f), Some(&376), "AMPERE_CHANNEL_GPFIFO_A");
+
+        // Every size is RM's own, and a class with no parameters is left out
+        // rather than sent as zero -- a zero would read as "copy nothing".
+        for c in abi::rmallow::v615_71_09::CLASS {
+            assert_eq!(
+                sizes.get(&c.class_id),
+                (c.params_size > 0).then_some(&c.params_size),
+                "class {:#x}",
+                c.class_id
+            );
+        }
+    }
+
+    /// Before the backend has learned a release it has nothing to say, and
+    /// saying nothing has to mean nothing: the guest reads this section by a
+    /// magic word for exactly that reason, and a zero-length section leaves it
+    /// on the table it was built with.
+    #[test]
+    fn a_backend_with_no_release_sends_no_sizes() {
+        let mut be = NvidiaBackend::for_test();
+        let mut buf = vec![0u8; 8192];
+        assert_eq!(be.write_alloc_size_section(&mut buf), 0);
+        assert!(buf.iter().all(|b| *b == 0), "something was written anyway");
+    }
+
     /// A class RM does not let an unprivileged caller allocate.
     #[test]
     fn a_class_rm_does_not_export_never_reaches_the_host() {

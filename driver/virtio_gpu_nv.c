@@ -82,6 +82,9 @@ extern struct kset *module_kset;
 /* Host → guest, on the event queue: this handle's descriptor is readable. */
 #define NVGPU_MSG_EVENT_READY 8
 
+/* "NVAL": opens the allocation-size section of a GET_SYS_FILES response. */
+#define NVGPU_ALLOC_SIZE_MAGIC 0x4e56414cu
+
 /* device_type values for OPEN */
 #define NVGPU_DEV_CTL 255
 #define NVGPU_DEV_UVM 256
@@ -558,6 +561,19 @@ struct nvgpu_device {
 #define NVGPU_MAX_DRI_DEVS 8
   struct nvgpu_dri_dev dri_devs[NVGPU_MAX_DRI_DEVS];
   int num_dri_devs;
+
+  /*
+   * What RM sizes each allocation at, as the backend read it out of the
+   * release the host is actually running. Empty until GET_SYS_FILES answers,
+   * and empty against a backend too old to say, in which case the compiled-in
+   * table in gen/nvgpu_rmalloc_classes.h is used as it was before.
+   */
+#define NVGPU_MAX_ALLOC_SIZES 256
+  struct {
+    u32 class_id;
+    u32 params_size;
+  } alloc_sizes[NVGPU_MAX_ALLOC_SIZES];
+  int num_alloc_sizes;
 
   /* ── PCI sysfs fake hierarchy ── */
   struct kobject *pci_bus_kobj;     /* /sys/bus/pci              */
@@ -1919,6 +1935,27 @@ out:
 }
 
 /*
+ * How many bytes of allocation parameters this class takes.
+ *
+ * The backend reads this out of the release the host is running and sends it
+ * with GET_SYS_FILES; that is the answer whenever it is there. The table
+ * compiled in below it was generated from one release and cannot be right for
+ * another: NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS gained two words between
+ * 595 and 615, so a guest carrying the older size forwards 20 bytes of a
+ * 28-byte struct and RM reads the remaining eight from past the end of the
+ * buffer. It is only a fallback, for a backend too old to say.
+ */
+static u32 nvgpu_host_alloc_param_size(struct nvgpu_device *dev, u32 hClass) {
+  int i;
+
+  for (i = 0; i < dev->num_alloc_sizes; i++)
+    if (dev->alloc_sizes[i].class_id == hClass)
+      return dev->alloc_sizes[i].params_size;
+
+  return nvgpu_rmalloc_class_param_size(hClass);
+}
+
+/*
  * nvgpu_ioctl_rm_alloc — NV_ESC_RM_ALLOC, same pattern via NVOS64_PARAMETERS.
  *
  * Subtlety: when paramsSize == 0 but pAllocParms != NULL, the host RM
@@ -1951,7 +1988,7 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
    */
   if (user_alloc && nested_size == 0) {
     u32 hClass = le32_to_cpu(params.hClass);
-    nested_size = nvgpu_rmalloc_class_param_size(hClass);
+    nested_size = nvgpu_host_alloc_param_size(nfd->dev, hClass);
     pr_debug(
         "virtio-gpu-nv: RM_ALLOC hClass=0x%04x paramsSize=0 → copy %u bytes\n",
         hClass, nested_size);
@@ -4437,6 +4474,59 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
                info[4], info[5], info[6]);
       p += name_len;
     }
+  }
+
+  /* ── Section 3: RM's allocation sizes ────────────────────────── */
+  /*
+   * Guarded by a magic word rather than by position. The DRI section above is
+   * positional, and a backend that does not write it does not fail -- the
+   * guest reads whatever follows the terminator as a count. This section
+   * cannot be read that way: a backend too old to send it leaves zeroed
+   * buffer here, and a count read out of zeroes would look like an answer.
+   */
+  {
+    __le32 raw;
+    u32 magic, count, i;
+
+    if (p + 8 > end)
+      goto out;
+
+    memcpy(&raw, p, sizeof(__le32));
+    magic = le32_to_cpu(raw);
+    if (magic != NVGPU_ALLOC_SIZE_MAGIC) {
+      dev_info(&dev->vdev->dev,
+               "virtio-gpu-nv: backend sent no allocation sizes; using the "
+               "table built into this module\n");
+      goto out;
+    }
+    memcpy(&raw, p + 4, sizeof(__le32));
+    count = le32_to_cpu(raw);
+    p += 8;
+
+    if (count > NVGPU_MAX_ALLOC_SIZES) {
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: backend sent %u allocation sizes, keeping %u\n",
+               count, (u32)NVGPU_MAX_ALLOC_SIZES);
+      count = NVGPU_MAX_ALLOC_SIZES;
+    }
+
+    dev->num_alloc_sizes = 0;
+    for (i = 0; i < count; i++) {
+      if (p + 8 > end) {
+        dev_warn(&dev->vdev->dev,
+                 "virtio-gpu-nv: allocation sizes truncated at entry %u\n", i);
+        break;
+      }
+      memcpy(&raw, p, sizeof(__le32));
+      dev->alloc_sizes[i].class_id = le32_to_cpu(raw);
+      memcpy(&raw, p + 4, sizeof(__le32));
+      dev->alloc_sizes[i].params_size = le32_to_cpu(raw);
+      p += 8;
+      dev->num_alloc_sizes++;
+    }
+    dev_info(&dev->vdev->dev,
+             "virtio-gpu-nv: the host's RM sizes %d allocation class(es)\n",
+             dev->num_alloc_sizes);
   }
 
 out:

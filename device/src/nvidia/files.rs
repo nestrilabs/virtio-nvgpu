@@ -196,7 +196,61 @@ impl NvidiaBackend {
         // and it still has to be written.
         if tree == FileTree::Sys {
             off += self.write_dri_section(&mut resp_buf[off..]);
+            off += self.write_alloc_size_section(&mut resp_buf[off..]);
         }
+        off
+    }
+
+    /// Magic word opening the allocation-size section.
+    ///
+    /// The DRI section above is positional: a guest reads whatever follows the
+    /// file terminator as its count, so a backend that omits a section does
+    /// not fail, it feeds the guest noise. A third section cannot be added
+    /// positionally for the same reason -- a guest from before it would read
+    /// these sizes as a DRI count. The magic is what lets a guest tell "the
+    /// backend sent this" from "the backend did not".
+    pub(super) const ALLOC_SIZE_MAGIC: u32 = 0x4e56_414c; // "NVAL"
+
+    /// What RM sizes each allocation at, for the release the host is running.
+    ///
+    /// `NV_ESC_RM_ALLOC` usually arrives with `paramsSize` zero: RM takes the
+    /// size from its own resource descriptor and NVIDIA's userspace does not
+    /// bother filling the field in. The guest driver still has to know how
+    /// many bytes to copy out of userspace before it can forward anything, so
+    /// it has carried a table of its own, generated from one release and
+    /// compiled in.
+    ///
+    /// That table cannot be right. `NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS`
+    /// grew two words between 595 and 615, so a guest built against the older
+    /// one forwards 20 bytes of a 28-byte struct and RM reads the other eight
+    /// from whatever follows the buffer. It is the backend that knows which
+    /// release the host runs, so the sizes come from here.
+    pub(super) fn write_alloc_size_section(&self, buf: &mut [u8]) -> usize {
+        let Some(sel) = self.rmallow else {
+            // Nothing learned about the host yet, so nothing to say. The guest
+            // keeps its own table, which is where it was before this section.
+            return 0;
+        };
+        let with_params: Vec<_> = sel.class.iter().filter(|c| c.params_size > 0).collect();
+        if buf.len() < 8 + with_params.len() * 8 {
+            log::warn!("no room for the allocation-size section; the guest will use its own table");
+            return 0;
+        }
+        let mut off = 0;
+        for v in [Self::ALLOC_SIZE_MAGIC, with_params.len() as u32] {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            off += 4;
+        }
+        for c in &with_params {
+            for v in [c.class_id, c.params_size] {
+                buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                off += 4;
+            }
+        }
+        log::info!(
+            "GET_SYS_FILES: RM's allocation sizes for {} class(es)",
+            with_params.len()
+        );
         off
     }
 
