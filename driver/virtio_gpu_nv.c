@@ -88,6 +88,24 @@ extern struct kset *module_kset;
 /* "NVUV": opens the UVM command section of the same response. */
 #define NVGPU_UVM_CMD_MAGIC 0x4e565556u
 
+/* "NVOD": opens the OS-descriptor section, which says where each of the three
+ * routes that register memory by a CPU address keeps its address. */
+#define NVGPU_OSDESC_MAGIC 0x4e564f44u
+
+/* `deep_ptr_offset` when the deep block is a table of guest-physical page
+ * runs rather than a buffer. One below NVGPU_DEEP_SEGMENTED, and for the same
+ * reason: a parameter block is a few hundred bytes, so no real offset is
+ * anywhere near either. Must match protocol/src/pageruns.rs. */
+#define NVGPU_DEEP_PAGE_RUNS 0xfffffffeu
+
+/* The most runs one registration may describe; the backend holds the same
+ * bound. A fully fragmented buffer costs one run per page, so this covers
+ * 4 MiB at worst and more when pages coalesce at all. */
+#define NVGPU_MAX_PAGE_RUNS 1024
+/* And the most pages, which is the backend's 256 MiB. A buffer that
+ * coalesces well can be far larger than the run bound suggests. */
+#define NVGPU_MAX_PIN_PAGES (65536)
+
 /* Which file a descriptor inside a UVM parameter block has to name. */
 #define NVGPU_UVM_FD_NONE 0
 #define NVGPU_UVM_FD_CTL 1
@@ -115,8 +133,11 @@ extern struct kset *module_kset;
   (NVGPU_CAP_COMPUTE | NVGPU_CAP_GRAPHICS | NVGPU_CAP_VIDEO | NVGPU_CAP_UTILITY)
 
 /* NVIDIA ioctl numbers that require nested-pointer marshalling */
+#define NV_ESC_RM_ALLOC_MEMORY 0x27
+#define NV_ESC_RM_FREE 0x29
 #define NV_ESC_RM_CONTROL 0x2a
 #define NV_ESC_RM_ALLOC 0x2b
+#define NV_ESC_RM_VID_HEAP_CONTROL 0x4a
 /* UVM_INITIALIZE ioctl nr */
 #define UVM_INITIALIZE_NR 0x30
 
@@ -261,6 +282,30 @@ struct virtio_gpu_nv_gpu_slot {
   __le32 padding[1];    /*   24.. 28                          */
   char info_text[448];  /*   28.. 476 raw information content  */
 } __packed;             /* 476 bytes */
+
+/* Where one route that registers memory by address keeps its fields. */
+struct nvgpu_osdesc_route {
+  u32 params_size; /* sizeof the block this route carries */
+  u32 address_at;  /* byte offset of the NvP64 CPU address */
+  u32 limit_at;    /* byte offset of the NvU64 limit, which is length - 1 */
+  u32 type_at;     /* byte offset of the descriptor type, or ~0 for none */
+};
+
+/* The three routes, and what tells one call from another. */
+struct nvgpu_osdesc {
+  bool valid;
+  u32 class_id;              /* NV01_MEMORY_SYSTEM_OS_DESCRIPTOR */
+  u32 vid_heap_function;     /* NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR */
+  u32 vid_heap_function_at;  /* where that function number sits */
+  u32 alloc_memory_class_at; /* NVOS02 carries its class in its parameters */
+  u32 virtual_address;       /* NVOS32_DESCRIPTOR_TYPE_VIRTUAL_ADDRESS */
+  u32 alloc_memory_status_at;
+  u32 vid_heap_status_at;
+  u32 vid_heap_hmemory_at; /* the handle the heap route reports back under */
+  struct nvgpu_osdesc_route alloc;
+  struct nvgpu_osdesc_route alloc_memory;
+  struct nvgpu_osdesc_route vid_heap;
+};
 
 /* One UVM call, as the backend read it out of the host's release. */
 struct nvgpu_uvm_cmd {
@@ -606,6 +651,16 @@ struct nvgpu_device {
   struct nvgpu_uvm_cmd uvm_cmds[NVGPU_MAX_UVM_CMDS];
   int num_uvm_cmds;
 
+  /*
+   * Where the host release keeps the CPU address on each route that lets a
+   * caller name memory by one. Not compiled in: the three routes put it in
+   * three different places and only the release says where, which is the
+   * lesson the allocation sizes taught. `valid` is false until GET_SYS_FILES
+   * answers, and without it no registration is attempted -- the backend
+   * refuses one with no pages anyway.
+   */
+  struct nvgpu_osdesc osdesc;
+
   /* ── PCI sysfs fake hierarchy ── */
   struct kobject *pci_bus_kobj;     /* /sys/bus/pci              */
   struct kobject *pci_devices_kobj; /* /sys/bus/pci/devices      */
@@ -644,6 +699,32 @@ struct nvgpu_fd {
   /* Answer to GET_DRM_FILE_UNIQUE_ID, assigned on first ask. Zero means
    * "not yet asked", which is why the counter starts at one. */
   u64 drm_unique_id;
+  /*
+   * Memory this file registered with RM by CPU address, still pinned.
+   *
+   * The pages have to stay put for as long as the GPU may reach them, which
+   * is until RM is told to free the object -- so the pin outlives the ioctl
+   * that made it and is released on the matching free, or on close for
+   * whatever a process did not free itself.
+   */
+  struct list_head pins;
+  struct mutex pins_lock;
+};
+
+/*
+ * One registration's worth of pinned pages.
+ *
+ * Keyed by what RM called the object, because that is all a later free
+ * names it by. The address is kept only for the log: a process may map the
+ * same pages at two addresses and RM would still see one object.
+ */
+struct nvgpu_pin {
+  struct list_head link;
+  u32 hclient;
+  u32 hmemory;
+  u64 uaddr;
+  unsigned long npages;
+  struct page **pages;
 };
 
 /* Posted on the event queue for the host to fill; see NVGPU_EVENT_BUFS. */
@@ -659,6 +740,19 @@ static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                            unsigned long arg);
 static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
                                void __user *uarg, unsigned int sz);
+/* Memory registered by a CPU address; defined with the pinning, further down,
+ * but reached from the allocation path above it. */
+static const struct nvgpu_osdesc_route *
+nvgpu_registration_route(struct nvgpu_device *dev, unsigned int nr,
+                         u32 class_id, const void *params, u32 len);
+static long nvgpu_ioctl_register_memory(struct nvgpu_fd *nfd, unsigned int cmd,
+                                        void __user *uarg, unsigned int sz,
+                                        const struct nvgpu_osdesc_route *route,
+                                        const void *outer,
+                                        unsigned int outer_len,
+                                        const void *params,
+                                        unsigned int params_len, u32 hclient,
+                                        u32 hmemory_at, u32 status_at);
 
 /*
  * A GEM parameter struct that carries a userspace pointer, described well
@@ -2060,6 +2154,29 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
     }
 
     /*
+     * Memory named by a CPU address, which is this class and no other. The
+     * pages behind that address are this kernel's to find and pin, and they
+     * travel with the call; the backend builds an address of its own that
+     * aliases them. Taken here rather than in the dispatcher because the
+     * address is in the allocation parameters, which only this path has
+     * copied in.
+     */
+    {
+      const struct nvgpu_osdesc_route *route = nvgpu_registration_route(
+          nfd->dev, NV_ESC_RM_ALLOC, le32_to_cpu(params.hClass), nested,
+          nested_size);
+
+      if (route) {
+        ret = nvgpu_ioctl_register_memory(
+            nfd, cmd, uarg, sz, route, &params, sizeof(params), nested,
+            nested_size, le32_to_cpu(params.hRoot),
+            /* the allocation routes report the handle as hObjectNew */
+            0xffffffffu, offsetof(struct NVOS64_PARAMETERS, status));
+        goto out;
+      }
+    }
+
+    /*
      * An event object names the file the event will be delivered on, and it
      * names it inside these parameters rather than at a fixed place in the
      * ioctl -- so the translation the device publishes for whole ioctls never
@@ -2237,6 +2354,391 @@ out:
   return ret;
 }
 
+/* ───────── memory registered by CPU address ───────── */
+
+/*
+ * RM registers memory by a CPU address and reads that address in the caller's
+ * address space -- which, for a guest, is the backend's. The address written
+ * here means nothing over there, so this side sends the guest-physical pages
+ * behind it instead and the backend builds an address of its own that aliases
+ * exactly those pages.
+ *
+ * Only this side can do it. The pages behind a user address are known to this
+ * kernel and nowhere else, and they have to be pinned before they are named:
+ * an unpinned page can be migrated or swapped, and the GPU would then be
+ * reading whatever took its place. FOLL_LONGTERM because RM holds them for the
+ * life of the object, not for the length of the call.
+ */
+
+static void nvgpu_pin_free(struct nvgpu_pin *pin) {
+  if (!pin)
+    return;
+  if (pin->pages) {
+    unpin_user_pages(pin->pages, pin->npages);
+    kvfree(pin->pages);
+  }
+  kfree(pin);
+}
+
+/*
+ * Pin the pages behind [uaddr, uaddr+len) and keep them.
+ *
+ * Whole pages only: a partial page cannot be named, and rounding one up would
+ * hand RM a neighbouring page that may be anyone's. The backend refuses the
+ * same thing from its side; this is so a guest learns it here, where the
+ * address still means something, rather than as a status code.
+ */
+static int nvgpu_pin_region(struct nvgpu_device *dev, u64 uaddr, u64 len,
+                            struct nvgpu_pin **out) {
+  struct nvgpu_pin *pin;
+  unsigned long npages;
+  long got;
+
+  if (!len || (uaddr & ~PAGE_MASK) || (len & ~PAGE_MASK)) {
+    dev_dbg(&dev->vdev->dev,
+            "virtio-gpu-nv: registering %llu bytes at %#llx is not whole "
+            "pages\n",
+            len, uaddr);
+    return -EINVAL;
+  }
+  npages = len >> PAGE_SHIFT;
+  if (npages > NVGPU_MAX_PIN_PAGES) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: registering %lu pages, and this module carries "
+             "%u\n",
+             npages, (unsigned int)NVGPU_MAX_PIN_PAGES);
+    return -E2BIG;
+  }
+
+  pin = kzalloc(sizeof(*pin), GFP_KERNEL);
+  if (!pin)
+    return -ENOMEM;
+  pin->uaddr = uaddr;
+  pin->npages = npages;
+  pin->pages = kvmalloc_array(npages, sizeof(*pin->pages), GFP_KERNEL);
+  if (!pin->pages) {
+    kfree(pin);
+    return -ENOMEM;
+  }
+
+  got = pin_user_pages_fast(uaddr, npages, FOLL_WRITE | FOLL_LONGTERM,
+                            pin->pages);
+  if (got < 0 || (unsigned long)got != npages) {
+    /* A short pin is not a partial success: the registration covers the
+     * whole range or it does not happen. */
+    if (got > 0)
+      unpin_user_pages(pin->pages, got);
+    kvfree(pin->pages);
+    kfree(pin);
+    dev_dbg(&dev->vdev->dev,
+            "virtio-gpu-nv: pinning %lu pages at %#llx gave %ld\n", npages,
+            uaddr, got);
+    return got < 0 ? (int)got : -EFAULT;
+  }
+
+  *out = pin;
+  return 0;
+}
+
+/*
+ * Write the pinned pages as runs of guest-physical memory.
+ *
+ * Consecutive pages are coalesced, which is what keeps the table small: a
+ * buffer the guest allocator gave out contiguously is one run however large
+ * it is. A fully scattered one costs a run per page, and past the bound the
+ * registration is refused rather than truncated -- a truncated table
+ * describes memory the caller did not ask to register.
+ */
+static int nvgpu_emit_page_runs(struct nvgpu_device *dev,
+                                const struct nvgpu_pin *pin, void *out,
+                                u32 out_cap, u32 *out_len) {
+  unsigned long i;
+  u32 runs = 0;
+  u64 run_gpa = 0, run_len = 0;
+  u8 *table = out;
+
+  for (i = 0; i <= pin->npages; i++) {
+    u64 gpa = i < pin->npages ? (u64)page_to_phys(pin->pages[i]) : 0;
+
+    if (run_len && i < pin->npages && gpa == run_gpa + run_len) {
+      run_len += PAGE_SIZE;
+      continue;
+    }
+    if (run_len) {
+      __le64 v;
+      u32 at = 8 + runs * 16;
+
+      if (runs == NVGPU_MAX_PAGE_RUNS || at + 16 > out_cap) {
+        dev_warn(&dev->vdev->dev,
+                 "virtio-gpu-nv: %lu pages scatter into more than %u runs; "
+                 "refusing to register them\n",
+                 pin->npages, (unsigned int)NVGPU_MAX_PAGE_RUNS);
+        return -E2BIG;
+      }
+      v = cpu_to_le64(run_gpa);
+      memcpy(table + at, &v, sizeof(v));
+      v = cpu_to_le64(run_len);
+      memcpy(table + at + 8, &v, sizeof(v));
+      runs++;
+    }
+    run_gpa = gpa;
+    run_len = i < pin->npages ? PAGE_SIZE : 0;
+  }
+
+  if (!runs)
+    return -EINVAL;
+  memset(table, 0, 8);
+  *(__le32 *)table = cpu_to_le32(runs);
+  *out_len = 8 + runs * 16;
+  dev_dbg(&dev->vdev->dev, "virtio-gpu-nv: %lu pages in %u run(s)\n",
+          pin->npages, runs);
+  return 0;
+}
+
+static u32 nvgpu_read32(const void *p, u32 at) {
+  __le32 v;
+
+  memcpy(&v, (const u8 *)p + at, sizeof(v));
+  return le32_to_cpu(v);
+}
+
+static u64 nvgpu_read64(const void *p, u32 at) {
+  __le64 v;
+
+  memcpy(&v, (const u8 *)p + at, sizeof(v));
+  return le64_to_cpu(v);
+}
+
+/*
+ * Whether this block registers memory by address, and on which route.
+ *
+ * `class_id` is the allocation's class where the caller already read it, or
+ * NVGPU_NO_CLASS where the route carries its own.
+ */
+#define NVGPU_NO_CLASS 0xffffffffu
+
+static const struct nvgpu_osdesc_route *
+nvgpu_registration_route(struct nvgpu_device *dev, unsigned int nr,
+                         u32 class_id, const void *params, u32 len) {
+  const struct nvgpu_osdesc *d = &dev->osdesc;
+
+  if (!d->valid)
+    return NULL;
+
+  switch (nr) {
+  case NV_ESC_RM_ALLOC:
+    if (class_id == d->class_id && len >= d->alloc.params_size)
+      return &d->alloc;
+    return NULL;
+  case NV_ESC_RM_ALLOC_MEMORY:
+    if (len >= d->alloc_memory_class_at + 4 &&
+        nvgpu_read32(params, d->alloc_memory_class_at) == d->class_id &&
+        len >= d->alloc_memory.params_size)
+      return &d->alloc_memory;
+    return NULL;
+  case NV_ESC_RM_VID_HEAP_CONTROL:
+    /* The parameters are a union, so the function has to be read before
+     * anything else in the block means what it looks like. */
+    if (len >= d->vid_heap_function_at + 4 &&
+        nvgpu_read32(params, d->vid_heap_function_at) == d->vid_heap_function &&
+        len >= d->vid_heap.params_size)
+      return &d->vid_heap;
+    return NULL;
+  default:
+    return NULL;
+  }
+}
+
+/* Release a registration this file made, by the handle RM gave it. */
+static void nvgpu_pin_release(struct nvgpu_fd *nfd, u32 hclient, u32 hmemory) {
+  struct nvgpu_pin *pin, *tmp;
+
+  mutex_lock(&nfd->pins_lock);
+  list_for_each_entry_safe(pin, tmp, &nfd->pins, link) {
+    if (pin->hclient == hclient && pin->hmemory == hmemory) {
+      list_del(&pin->link);
+      mutex_unlock(&nfd->pins_lock);
+      dev_dbg(&nfd->dev->vdev->dev,
+              "virtio-gpu-nv: unpinning %lu page(s) for object %#x/%#x\n",
+              pin->npages, hclient, hmemory);
+      nvgpu_pin_free(pin);
+      return;
+    }
+  }
+  mutex_unlock(&nfd->pins_lock);
+}
+
+/* Everything this file still holds, on close. */
+static void nvgpu_pins_drain(struct nvgpu_fd *nfd) {
+  struct nvgpu_pin *pin, *tmp;
+  LIST_HEAD(dead);
+
+  mutex_lock(&nfd->pins_lock);
+  list_splice_init(&nfd->pins, &dead);
+  mutex_unlock(&nfd->pins_lock);
+
+  list_for_each_entry_safe(pin, tmp, &dead, link) {
+    dev_dbg(&nfd->dev->vdev->dev,
+            "virtio-gpu-nv: close leaves %lu pinned page(s) for %#x/%#x\n",
+            pin->npages, pin->hclient, pin->hmemory);
+    list_del(&pin->link);
+    nvgpu_pin_free(pin);
+  }
+}
+
+/*
+ * Forward one call that registers memory by a CPU address.
+ *
+ * The parameters go as they are -- the backend rewrites the address field
+ * itself, because only it knows what the pages became over there -- and the
+ * pinned pages ride in the deep block, which is where a second-level buffer
+ * goes. The deep block normally carries what a pointer in the parameters
+ * addresses; this carries where that pointer's memory physically is. Same
+ * field, different fact about it.
+ *
+ * `outer` is the flat struct, `params` the block the route's offsets are
+ * measured in. For the allocation route those differ: the address lives in
+ * the allocation parameters, which travel as the nested block.
+ */
+static long nvgpu_ioctl_register_memory(struct nvgpu_fd *nfd, unsigned int cmd,
+                                        void __user *uarg, unsigned int sz,
+                                        const struct nvgpu_osdesc_route *route,
+                                        const void *outer, unsigned int outer_len,
+                                        const void *params, unsigned int params_len,
+                                        u32 hclient, u32 hmemory_at,
+                                        u32 status_at) {
+  struct nvgpu_device *dev = nfd->dev;
+  struct nvgpu_pin *pin = NULL;
+  struct nvgpu_ioctl_req *req;
+  struct nvgpu_ioctl_resp *resp;
+  void *req_buf = NULL, *resp_buf = NULL;
+  u32 runs_cap = 8 + NVGPU_MAX_PAGE_RUNS * 16;
+  u32 runs_len = 0;
+  u64 addr, limit, length;
+  int req_total, resp_max, ret;
+
+  /* Only a user address is something this side can find pages for. The other
+   * descriptor types name a kernel address, a file handle, a dma-buf or a
+   * scatter-gather table, and the backend refuses every one of them. */
+  if (route->type_at != 0xffffffffu && params_len >= route->type_at + 4 &&
+      nvgpu_read32(params, route->type_at) != dev->osdesc.virtual_address) {
+    dev_dbg(&dev->vdev->dev,
+            "virtio-gpu-nv: registration descriptor type %u is not a user "
+            "address\n",
+            nvgpu_read32(params, route->type_at));
+    return -ENOTTY;
+  }
+
+  addr = nvgpu_read64(params, route->address_at);
+  limit = nvgpu_read64(params, route->limit_at);
+  /* RM's `limit` is the last byte's offset, so a one-page registration
+   * carries 4095 and means 4096. */
+  if (limit == U64_MAX)
+    return -EINVAL;
+  length = limit + 1;
+
+  ret = nvgpu_pin_region(dev, addr, length, &pin);
+  if (ret)
+    return ret;
+
+  req_total = sizeof(*req) + outer_len + params_len + runs_cap;
+  resp_max = sizeof(*resp) + outer_len + params_len + runs_cap;
+  req_buf = kvzalloc(req_total, GFP_KERNEL);
+  resp_buf = kvzalloc(resp_max, GFP_KERNEL);
+  if (!req_buf || !resp_buf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+
+  memcpy(req_buf + sizeof(*req), outer, outer_len);
+  if (params != outer)
+    memcpy(req_buf + sizeof(*req) + outer_len, params, params_len);
+
+  ret = nvgpu_emit_page_runs(dev, pin,
+                             req_buf + sizeof(*req) + outer_len +
+                                 (params != outer ? params_len : 0),
+                             runs_cap, &runs_len);
+  if (ret)
+    goto out;
+
+  req = (struct nvgpu_ioctl_req *)req_buf;
+  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
+  req->hdr.handle = cpu_to_le32(nfd->handle);
+  req->hdr.status = 0;
+  req->hdr.padding = 0;
+  req->cmd = cpu_to_le32(cmd);
+  req->data_len = cpu_to_le32(outer_len);
+  if (params != outer) {
+    req->nested_offset = cpu_to_le32(outer_len);
+    req->nested_len = cpu_to_le32(params_len);
+  } else {
+    req->nested_offset = 0;
+    req->nested_len = 0;
+  }
+  req->deep_ptr_offset = cpu_to_le32(NVGPU_DEEP_PAGE_RUNS);
+  req->deep_len = cpu_to_le32(runs_len);
+
+  req_total = sizeof(*req) + outer_len +
+              (params != outer ? params_len : 0) + runs_len;
+  ret = nvgpu_send_recv(dev, req_buf, req_total, resp_buf, resp_max);
+  if (ret < 0)
+    goto out;
+
+  resp = (struct nvgpu_ioctl_resp *)resp_buf;
+  ret = (int)(s32)le32_to_cpu((__le32)((struct nvgpu_msg_hdr *)resp_buf)->status);
+  if (ret)
+    goto out;
+
+  {
+    void *body = resp_buf + sizeof(*resp);
+    u32 back = le32_to_cpu(resp->data_len);
+    u32 nested_back = le32_to_cpu(resp->nested_len);
+    u32 status;
+
+    if (back > outer_len)
+      back = outer_len;
+    if (nested_back > params_len)
+      nested_back = params_len;
+
+    /* RM's own answer decides whether the pin is kept. A refusal that was
+     * not an errno still means nothing was registered, and holding the
+     * pages for it would pin them until the file closed. */
+    status = back >= status_at + 4 ? nvgpu_read32(body, status_at) : ~0u;
+    if (status == 0) {
+      pin->hclient = hclient;
+      pin->hmemory = hmemory_at == 0xffffffffu
+                         ? nvgpu_read32(body, 8) /* hObjectNew */
+                         : nvgpu_read32(body + back, hmemory_at);
+      mutex_lock(&nfd->pins_lock);
+      list_add(&pin->link, &nfd->pins);
+      mutex_unlock(&nfd->pins_lock);
+      dev_dbg(&dev->vdev->dev,
+              "virtio-gpu-nv: registered %lu page(s) as object %#x/%#x\n",
+              pin->npages, pin->hclient, pin->hmemory);
+      pin = NULL;
+    }
+
+    if (copy_to_user(uarg, body, min_t(u32, back, sz)))
+      ret = -EFAULT;
+    else if (params != outer && nested_back) {
+      /* The allocation parameters came from a pointer of the caller's, and
+       * that is where the answer goes back. */
+      u64 p = nvgpu_read64(outer, 16); /* NVOS64.pAllocParms */
+
+      if (p && copy_to_user((void __user *)(unsigned long)p,
+                            body + back, nested_back))
+        ret = -EFAULT;
+    }
+  }
+
+out:
+  /* Not kept means not registered, so the pages go back. */
+  nvgpu_pin_free(pin);
+  kvfree(req_buf);
+  kvfree(resp_buf);
+  return ret;
+}
+
 static const struct nvgpu_fd_translation_entry *
 nvgpu_find_fd_translation(struct nvgpu_device *dev, unsigned int nr) {
   u32 i;
@@ -2244,6 +2746,58 @@ nvgpu_find_fd_translation(struct nvgpu_device *dev, unsigned int nr) {
     if (le32_to_cpu(dev->fd_translations[i].nr) == nr)
       return &dev->fd_translations[i];
   return NULL;
+}
+
+/* `nvgpu_ioctl_maybe_register` when the call turns out not to be one. */
+#define NVGPU_NOT_A_REGISTRATION 0x7fffffffL
+
+/*
+ * The two routes whose address sits in the flat parameter struct.
+ *
+ * Returns NVGPU_NOT_A_REGISTRATION when the block is some other call, which
+ * is most of them: VID_HEAP_CONTROL is a union and only one of its functions
+ * names an address, and RM_ALLOC_MEMORY allocates every other class too.
+ */
+static long nvgpu_ioctl_maybe_register(struct nvgpu_fd *nfd, unsigned int cmd,
+                                       void __user *uarg, unsigned int sz,
+                                       unsigned int nr) {
+  const struct nvgpu_osdesc *d = &nfd->dev->osdesc;
+  const struct nvgpu_osdesc_route *route;
+  void *params;
+  long ret;
+  u32 hmemory_at, status_at;
+
+  if (!d->valid || sz == 0 || sz > 64 * 1024)
+    return NVGPU_NOT_A_REGISTRATION;
+
+  params = kzalloc(sz, GFP_KERNEL);
+  if (!params)
+    return -ENOMEM;
+  if (copy_from_user(params, uarg, sz)) {
+    kfree(params);
+    return -EFAULT;
+  }
+
+  route = nvgpu_registration_route(nfd->dev, nr, NVGPU_NO_CLASS, params, sz);
+  if (!route) {
+    kfree(params);
+    return NVGPU_NOT_A_REGISTRATION;
+  }
+
+  if (nr == NV_ESC_RM_VID_HEAP_CONTROL) {
+    hmemory_at = d->vid_heap_hmemory_at;
+    status_at = d->vid_heap_status_at;
+  } else {
+    /* hObjectNew, where the allocation routes put it. */
+    hmemory_at = 0xffffffffu;
+    status_at = d->alloc_memory_status_at;
+  }
+
+  ret = nvgpu_ioctl_register_memory(nfd, cmd, uarg, sz, route, params, sz,
+                                    params, sz, nvgpu_read32(params, 0),
+                                    hmemory_at, status_at);
+  kfree(params);
+  return ret;
 }
 
 /* Main ioctl dispatcher */
@@ -2265,6 +2819,19 @@ static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   if (sz > 65536)
     return -EINVAL;
 
+  /*
+   * Memory named by a CPU address, before anything else looks at the block.
+   * Two of the three routes would otherwise be handled by paths that know
+   * nothing about it: NV_ESC_RM_ALLOC_MEMORY has a descriptor translation
+   * entry, and VID_HEAP_CONTROL falls through to the plain forwarder.
+   */
+  if (nr == NV_ESC_RM_ALLOC_MEMORY || nr == NV_ESC_RM_VID_HEAP_CONTROL) {
+    long rc = nvgpu_ioctl_maybe_register(nfd, cmd, uarg, sz, nr);
+
+    if (rc != NVGPU_NOT_A_REGISTRATION)
+      return rc;
+  }
+
   fdt = nvgpu_find_fd_translation(nfd->dev, nr);
   if (fdt)
     return nvgpu_ioctl_translate_fd(nfd, cmd, uarg, sz,
@@ -2275,6 +2842,19 @@ static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
     return nvgpu_ioctl_rm_control(nfd, cmd, uarg, sz);
   case NV_ESC_RM_ALLOC:
     return nvgpu_ioctl_rm_alloc(nfd, cmd, uarg, sz);
+  case NV_ESC_RM_FREE:
+    /* Whatever RM makes of it, the object is not ours to hold pages for
+     * any longer. NVOS00: hRoot at 0, hObjectOld at 8. */
+    {
+      long rc = nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+      u32 free_params[4];
+
+      if (sz >= sizeof(free_params) &&
+          !copy_from_user(free_params, uarg, sizeof(free_params)))
+        nvgpu_pin_release(nfd, le32_to_cpu((__le32)free_params[0]),
+                          le32_to_cpu((__le32)free_params[2]));
+      return rc;
+    }
   default:
     return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
   }
@@ -2541,6 +3121,8 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
   }
 
   nfd->dev = dev;
+  INIT_LIST_HEAD(&nfd->pins);
+  mutex_init(&nfd->pins_lock);
   nfd->device_type = device_type;
 
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
@@ -2581,6 +3163,14 @@ static int nvgpu_release(struct inode *inode, struct file *filp) {
   struct nvgpu_fd *nfd = filp->private_data;
   struct nvgpu_msg_hdr *req;
   struct nvgpu_msg_hdr *resp;
+
+  /*
+   * Before the close reaches the backend, because closing the file is what
+   * makes RM drop the objects that were holding these pages. A process that
+   * frees its registrations gets here with nothing left; one that exits
+   * without freeing them gets them released here instead of never.
+   */
+  nvgpu_pins_drain(nfd);
 
   req = kzalloc(sizeof(*req), GFP_KERNEL);
   resp = kzalloc(sizeof(*resp), GFP_KERNEL);
@@ -3779,6 +4369,8 @@ static int nvgpu_dri_open(struct inode *inode, struct file *filp) {
   }
 
   nfd->dev = dev;
+  INIT_LIST_HEAD(&nfd->pins);
+  mutex_init(&nfd->pins_lock);
   nfd->device_type = NVGPU_DEV_DRI_BASE + dri->index;
 
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
@@ -3852,6 +4444,8 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   }
 
   nfd->dev = dev;
+  INIT_LIST_HEAD(&nfd->pins);
+  mutex_init(&nfd->pins_lock);
   nfd->device_type = NVGPU_DEV_DRI_BASE + dri->index;
 
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
@@ -4641,6 +5235,83 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     dev_info(&dev->vdev->dev,
              "virtio-gpu-nv: the host release takes %d UVM call(s)\n",
              dev->num_uvm_cmds);
+  }
+
+  /* ── Section 5: where memory may be registered by a CPU address ─── */
+  /*
+   * Magic-guarded like the two before it. Without this section nothing here
+   * recognises a registration, so none is attempted and the backend refuses
+   * the call -- which is what it did before any of this existed.
+   */
+  {
+    __le32 raw;
+    u32 w[22];
+    int i;
+
+    if (p + sizeof(w) > end)
+      goto out;
+
+    memcpy(&raw, p, sizeof(__le32));
+    if (le32_to_cpu(raw) != NVGPU_OSDESC_MAGIC) {
+      dev_info(&dev->vdev->dev,
+               "virtio-gpu-nv: backend says nothing about registering memory "
+               "by address; such calls will be refused\n");
+      goto out;
+    }
+    for (i = 0; i < (int)ARRAY_SIZE(w); i++) {
+      memcpy(&raw, p + i * 4, sizeof(__le32));
+      w[i] = le32_to_cpu(raw);
+    }
+    p += sizeof(w);
+
+    dev->osdesc.class_id = w[1];
+    dev->osdesc.vid_heap_function = w[2];
+    dev->osdesc.vid_heap_function_at = w[3];
+    dev->osdesc.alloc_memory_class_at = w[4];
+    dev->osdesc.virtual_address = w[5];
+    dev->osdesc.alloc_memory_status_at = w[6];
+    dev->osdesc.vid_heap_status_at = w[7];
+    dev->osdesc.vid_heap_hmemory_at = w[8];
+    /* w[9] reserved */
+    dev->osdesc.alloc.params_size = w[10];
+    dev->osdesc.alloc.address_at = w[11];
+    dev->osdesc.alloc.limit_at = w[12];
+    dev->osdesc.alloc.type_at = w[13];
+    dev->osdesc.alloc_memory.params_size = w[14];
+    dev->osdesc.alloc_memory.address_at = w[15];
+    dev->osdesc.alloc_memory.limit_at = w[16];
+    dev->osdesc.alloc_memory.type_at = w[17];
+    dev->osdesc.vid_heap.params_size = w[18];
+    dev->osdesc.vid_heap.address_at = w[19];
+    dev->osdesc.vid_heap.limit_at = w[20];
+    dev->osdesc.vid_heap.type_at = w[21];
+
+    /*
+     * An address or a limit the record places outside its own block would
+     * have this module read past what its caller sent. The backend is not
+     * what is being defended against here; a wrong answer from anywhere is.
+     */
+    {
+      const struct nvgpu_osdesc_route *r[3] = {
+          &dev->osdesc.alloc, &dev->osdesc.alloc_memory, &dev->osdesc.vid_heap};
+
+      dev->osdesc.valid = true;
+      for (i = 0; i < 3; i++) {
+        if ((u64)r[i]->address_at + 8 > r[i]->params_size ||
+            (u64)r[i]->limit_at + 8 > r[i]->params_size) {
+          dev_warn(&dev->vdev->dev,
+                   "virtio-gpu-nv: route %d puts its address at %u of %u "
+                   "bytes; registering memory by address stays refused\n",
+                   i, r[i]->address_at, r[i]->params_size);
+          dev->osdesc.valid = false;
+        }
+      }
+    }
+    if (dev->osdesc.valid)
+      dev_info(&dev->vdev->dev,
+               "virtio-gpu-nv: memory may be registered by address, class "
+               "0x%04x\n",
+               dev->osdesc.class_id);
   }
 
 out:
