@@ -1,5 +1,5 @@
 # Keeps one draft release up to date with every commit since the last
-# published release: "- <commit title> (<author>)", oldest first.
+# published release: "- <commit title> (@author)", oldest first.
 #
 # To release: open the draft, change the tag if the guessed one is wrong,
 # write anything extra ABOVE the marker line, publish. Text above the marker
@@ -38,12 +38,27 @@ jobs:
           # No release yet is a 404, and gh prints the error body to stdout.
           last=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null) || last=
           if [ -n "$last" ]; then range="$last..HEAD"; else range=HEAD; fi
-          commits=$(git log --reverse --no-merges --format='- %s (%an)' "$range")
+          # Authors as @login, so GitHub links them and one person committing
+          # under two names is credited once. The login is GitHub's, from the
+          # commit's email; a commit whose email no account claims keeps its
+          # git name.
+          since=''
+          if [ -n "$last" ]; then
+            since="&since=$(git log -1 --format=%cI "$last")"
+          fi
+          gh api "repos/$REPO/commits?sha=$GITHUB_SHA&per_page=100$since" --paginate \
+            --jq '.[] | "\(.sha)\t\(.author.login // "")"' > "$RUNNER_TEMP/logins"
+          commits=$(git log --reverse --no-merges --format='%H%x09%an%x09%s' "$range" |
+            awk -F '\t' -v logins="$RUNNER_TEMP/logins" '
+              BEGIN { while ((getline l < logins) > 0) { split(l, f, "\t"); if (f[2] != "") login[f[1]] = f[2] } }
+              { who = ($1 in login) ? "@" login[$1] : $2
+                s = $0; sub(/^[^\t]*\t[^\t]*\t/, "", s)
+                print "- " s " (" who ")" }')
           [ -n "$commits" ] || commits='- (no commits since the last release)'
           if [ -n "$last" ]; then
-            since="Since $last:"
+            heading="Since $last:"
           else
-            since="All commits (no release yet):"
+            heading="All commits (no release yet):"
           fi
 
           draft=$(gh api "repos/$REPO/releases" --paginate \
@@ -67,7 +82,7 @@ jobs:
             next=v0.1.0
           fi
 
-          body=$(printf '%s\n%s\n\n%s\n\n%s\n' "$top" "$marker" "$since" "$commits")
+          body=$(printf '%s\n%s\n\n%s\n\n%s\n' "$top" "$marker" "$heading" "$commits")
 
           if [ -n "$draft" ]; then
             case "$tag" in untagged-*|'') tag=$next ;; esac
