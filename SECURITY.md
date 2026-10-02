@@ -40,6 +40,7 @@ These hold on this branch.
 | privilege | running as root or with CAP_SYS_ADMIN; the backend does not start, and drops every capability and sets no_new_privs before it opens a device |
 | capabilities | device nodes and RM classes outside `--caps`: `nvidia-uvm` without compute, `nvidia-modeset` and render nodes without graphics, 3D classes without graphics, NVENC, NVDEC, NVJPG and OFA classes without video |
 | UVM tools | `nvidia-uvm-tools`, under every capability |
+| the backend's own reach | every path but the GPU nodes, the driver's `/proc` and `/sys` trees and the socket's directory; every executable mapping; every new process; every socket but AF_UNIX; every system call outside the allowlist. A kernel without Landlock or without seccomp filtering is refused at start |
 | UVM init | the guest's UVM_INITIALIZE flags; the backend sends its own, with HMM off and sharing mode on, and pageable access off where the release has the flag |
 | embedded pointers | a guest address in a pointer RM dereferences inside an RM control's parameters: the backend supplies every such buffer itself, sized from the count in the guest's own block and bounded at 1 MiB per pointer and 2 MiB per call |
 | allocation rights | `NVOS64.pRightsRequested`, a pointer RM dereferences when it is not null; the host sees null and the caller gets its own value back |
@@ -69,8 +70,6 @@ its user can.
 
 - An RM allowlist. RM controls and classes inside a capability are forwarded
   without a per-release list of what is safe to expose.
-- A sandbox for the backend. Landlock and seccomp confinement is in progress.
-  Today the backend can open anything its user can.
 - UVM size tables. UVM ioctls are not yet checked against per-release sizes,
   which is one reason compute is opt-in.
 - Memory registered by CPU address. Allocations that name guest memory by
@@ -88,7 +87,7 @@ model. The comparison, item by item:
 |---|---|---|
 | host kernel exposure from general code | gVisor's Sentry, behind a seccomp filter | a guest kernel under KVM |
 | which ioctls reach the driver | an allowlist per driver release | an ABI profile per release; an RM allowlist is not built |
-| process confining the forwarder | seccomp | in progress |
+| process confining the forwarder | seccomp | seccomp and Landlock, entered before the first thread |
 | driver bugs in forwarded calls | not mitigated | not mitigated |
 | DMA buffer validation | none | none |
 
