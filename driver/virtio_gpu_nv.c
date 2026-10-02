@@ -493,13 +493,13 @@ struct nvgpu_device {
   bool has_uvm_tools;
   bool has_modeset;
 
-  /* Serialise virtqueue access */
-  struct mutex vq_lock;
-
-  /* Completion for synchronous request */
-  struct completion req_done;
-  void *resp_buf;
-  int resp_len;
+  /*
+   * Serialises every operation on the control queue: adding a request in
+   * process context and taking finished ones back in the interrupt. A
+   * virtqueue is not safe to use from two places at once, so a spinlock,
+   * taken with interrupts off.
+   */
+  spinlock_t vq_lock;
 
   /* GPU slots read from config space at probe */
   struct virtio_gpu_nv_gpu_slot gpu_slots[8];
@@ -1133,53 +1133,99 @@ static long nvgpu_dri_ioctl(struct file *filp, unsigned int cmd,
 /* ───────── Virtqueue communication ───────── */
 
 /*
+ * One request in flight on the control queue.
+ *
+ * Each caller has its own, so two threads with calls outstanding are each
+ * woken by their own answer. This used to be one completion and one response
+ * pointer for the whole device: a second caller re-armed the completion the
+ * first was waiting on, and whichever waiter woke first returned with a buffer
+ * the device might not have written yet.
+ *
+ * The request and response bytes live here, not in the caller's buffers, so
+ * that a caller who stops waiting -- killed, or timed out -- can leave. The
+ * device still holds the buffers until it answers; the callback then frees the
+ * token rather than writing into memory its caller has since freed.
+ */
+struct nvgpu_req {
+  struct completion done;
+  bool abandoned; /* under vq_lock */
+  unsigned int written;
+  int req_len, resp_len;
+  u8 data[]; /* request, then response */
+};
+
+/*
  * nvgpu_send_recv — submit one request to controlq and block until the VMM
- * returns the response.  Caller must supply pre-allocated resp buffer.
+ * returns the response, which is copied into `resp`.
  */
 static int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
                            void *resp, int resp_len) {
   struct scatterlist sg_out, sg_in;
   struct scatterlist *sgs[2] = {&sg_out, &sg_in};
+  struct nvgpu_req *r;
+  unsigned long flags;
+  bool notify;
+  long left;
   int ret;
 
-  mutex_lock(&dev->vq_lock);
+  /* Not zeroed: only the bytes the device reports writing are copied out. */
+  r = kmalloc(struct_size(r, data, req_len + resp_len), GFP_KERNEL);
+  if (!r)
+    return -ENOMEM;
+  init_completion(&r->done);
+  r->abandoned = false;
+  r->written = 0;
+  r->req_len = req_len;
+  r->resp_len = resp_len;
+  memcpy(r->data, req, req_len);
 
-  reinit_completion(&dev->req_done);
-  dev->resp_buf = resp;
-  dev->resp_len = resp_len;
+  sg_init_one(&sg_out, r->data, req_len);
+  sg_init_one(&sg_in, r->data + req_len, resp_len);
 
-  sg_init_one(&sg_out, req, req_len);
-  sg_init_one(&sg_in, resp, resp_len);
-
-  ret = virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, resp, GFP_KERNEL);
+  spin_lock_irqsave(&dev->vq_lock, flags);
+  ret = virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, r, GFP_ATOMIC);
+  notify = ret == 0 && virtqueue_kick_prepare(dev->ctrl_vq);
+  spin_unlock_irqrestore(&dev->vq_lock, flags);
   if (ret < 0) {
-    mutex_unlock(&dev->vq_lock);
+    kfree(r);
     return ret;
   }
+  if (notify)
+    virtqueue_notify(dev->ctrl_vq);
 
-  mutex_unlock(&dev->vq_lock);
-  virtqueue_kick(dev->ctrl_vq);
+  left = wait_for_completion_killable_timeout(&r->done, 10 * HZ);
 
-  ret = wait_for_completion_killable_timeout(&dev->req_done, 10 * HZ);
-  if (ret == 0) {
-    return -ETIMEDOUT;
+  spin_lock_irqsave(&dev->vq_lock, flags);
+  if (left <= 0 && !completion_done(&r->done)) {
+    /* Still the device's. The callback frees it when it comes back. */
+    r->abandoned = true;
+    spin_unlock_irqrestore(&dev->vq_lock, flags);
+    return left == 0 ? -ETIMEDOUT : (int)left;
   }
-  if (ret < 0) {
-    return ret;
-  }
+  spin_unlock_irqrestore(&dev->vq_lock, flags);
 
+  memcpy(resp, r->data + req_len, min_t(int, r->written, resp_len));
+  kfree(r);
   return 0;
 }
 
-/* Virtqueue callback: VMM has written the response buffer */
+/* Virtqueue callback: the VMM has answered one or more requests. */
 static void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
   struct nvgpu_device *dev = vq->vdev->priv;
-  void *buf;
+  struct nvgpu_req *r;
+  unsigned long flags;
   unsigned int len;
 
-  while ((buf = virtqueue_get_buf(vq, &len)) != NULL) {
-    complete(&dev->req_done);
+  spin_lock_irqsave(&dev->vq_lock, flags);
+  while ((r = virtqueue_get_buf(vq, &len)) != NULL) {
+    if (r->abandoned) {
+      kfree(r);
+      continue;
+    }
+    r->written = len;
+    complete(&r->done);
   }
+  spin_unlock_irqrestore(&dev->vq_lock, flags);
 }
 
 /* ───────── Events from the host ───────── */
@@ -4340,8 +4386,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
 
   dev->vdev = vdev;
   vdev->priv = dev;
-  mutex_init(&dev->vq_lock);
-  init_completion(&dev->req_done);
+  spin_lock_init(&dev->vq_lock);
   INIT_LIST_HEAD(&dev->fds);
   spin_lock_init(&dev->fds_lock);
 
