@@ -619,7 +619,7 @@ mod tests {
     #[test]
     fn the_guest_is_told_what_rm_sizes_an_allocation_at() {
         let host = CountingHost::default();
-        let (mut be, _h) = backend_on(&host);
+        let (be, _h) = backend_on(&host);
         let mut buf = vec![0u8; 8192];
         let n = be.write_alloc_size_section(&mut buf);
         assert!(n >= 8, "the section was not written");
@@ -656,7 +656,7 @@ mod tests {
     /// on the table it was built with.
     #[test]
     fn a_backend_with_no_release_sends_no_sizes() {
-        let mut be = NvidiaBackend::for_test();
+        let be = NvidiaBackend::for_test();
         let mut buf = vec![0u8; 8192];
         assert_eq!(be.write_alloc_size_section(&mut buf), 0);
         assert!(buf.iter().all(|b| *b == 0), "something was written anyway");
