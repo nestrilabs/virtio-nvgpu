@@ -34,6 +34,7 @@ impl NvidiaBackend {
         self.rmctrl = abi::rmctrl::select(v);
         self.rmallow = abi::rmallow::select(v);
         self.uvm = abi::uvm::select(v);
+        self.osdesc = abi::osdesc::select(v);
         match self.abi {
             Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
             None => log::warn!(
@@ -57,7 +58,6 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
-        const NVOS64_STATUS: usize = 40;
         const NV_ERR_INVALID_CLASS: u32 = 0x22;
         let needs = if bit == crate::caps::VIDEO {
             "video"
@@ -192,7 +192,6 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
-        const NVOS64_STATUS: usize = 40;
         const NV_ERR_INVALID_CLASS: u32 = 0x22;
         self.note_allow_refusal(format!("RM_ALLOC class {class:#06x}"), why);
         let mut out = param_in.to_vec();
@@ -448,6 +447,11 @@ impl NvidiaBackend {
             }
 
             NV_ESC_RM_ALLOC_MEMORY => {
+                // The older of the two allocation escapes, and it carries its
+                // class inside the parameters rather than beside them.
+                if let Some(route) = self.registration_by_address(escape, None, param_in) {
+                    return self.refuse_registration(cookie, route, param_in, param_in, resp_buf);
+                }
                 self.dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, resp_buf)
             }
 
@@ -512,10 +516,27 @@ impl NvidiaBackend {
                     if let Some(why) = self.rm_class_refusal(class, have) {
                         return self.refuse_alloc(cookie, class, why, param_in, resp_buf);
                     }
+                    // RM marks this class non-privileged, so the allowlist
+                    // above lets it through: RM is right, for a caller whose
+                    // address space is its own. Here it is not.
+                    let nested = &param_in[(ireq.data_len as usize).min(param_in.len())..];
+                    if let Some(route) = self.registration_by_address(escape, Some(class), nested) {
+                        return self.refuse_registration(cookie, route, nested, param_in, resp_buf);
+                    }
                 }
                 self.dispatch_nested(
                     cookie, host_fd, request, param_in, resp_buf, 48, 16, 32, deep_in, None,
                 )
+            }
+
+            // The heap ioctl is a union, and exactly one of its functions
+            // names memory by a CPU address. The other twenty are ordinary
+            // heap operations and go through as they always have.
+            NV_ESC_RM_VID_HEAP_CONTROL => {
+                if let Some(route) = self.registration_by_address(escape, None, param_in) {
+                    return self.refuse_registration(cookie, route, param_in, param_in, resp_buf);
+                }
+                self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf)
             }
 
             // ---------------------------------------------------------------

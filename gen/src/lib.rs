@@ -6,6 +6,7 @@
 
 pub mod fixtures;
 pub mod ioctl;
+pub mod osdesc;
 pub mod rmallow;
 pub mod rmctrl;
 pub mod types;

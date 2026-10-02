@@ -436,6 +436,34 @@ mod tests {
         resp
     }
 
+    /// As `send_nested`, where the nested block has contents rather than being
+    /// a length's worth of zeroes.
+    fn send_nested_bytes(
+        be: &mut NvidiaBackend,
+        h: u64,
+        escape: u32,
+        top: &[u8],
+        nested: &[u8],
+    ) -> Vec<u8> {
+        let mut v = hdr(MsgType::Ioctl, h);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(escape, top.len() as u32) as u32,
+                data_len: top.len() as u32,
+                nested_offset: if nested.is_empty() { 0 } else { 16 },
+                nested_len: nested.len() as u32,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(top);
+        v.extend_from_slice(nested);
+        let mut resp = vec![0u8; 4096 + top.len() + nested.len()];
+        be.dispatch(&v, &mut resp);
+        resp
+    }
+
     /// An ioctl whose top-level struct is followed by a nested block: the
     /// allocation parameters of an RM_ALLOC, or the parameter block of an
     /// RM_CONTROL. That block is what the pointer in the struct addresses, and
@@ -1405,6 +1433,154 @@ mod tests {
             "{cycles} cycles leaked host file descriptors"
         );
         c.be.teardown();
+    }
+
+    // ==================================================================
+    // Memory named by a CPU address
+    // ==================================================================
+
+    /// An address from a guest is an address in the guest's process. RM reads
+    /// it in this one. Every route that carries one is refused, and the fake
+    /// host is what proves the host was never asked.
+    fn osdesc() -> abi::osdesc::OsDesc {
+        abi::osdesc::select(abi::version::DriverVersion::new(615, 71, 9))
+            .expect("615.71.09 has a table")
+    }
+
+    /// `NV_ESC_RM_ALLOC` of the class, with the address in the nested block.
+    #[test]
+    fn registering_memory_by_address_through_rm_alloc_is_refused() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_caps(crate::caps::Caps::parse("graphics,compute,video,utility").unwrap());
+        let d = osdesc();
+
+        let mut params = vec![0u8; d.alloc.params_size];
+        params[d.alloc.address_at..d.alloc.address_at + 8]
+            .copy_from_slice(&0x7fff_0000_0000u64.to_le_bytes());
+        params[d.alloc.limit_at..d.alloc.limit_at + 8]
+            .copy_from_slice(&(0x200000u64 - 1).to_le_bytes());
+
+        let resp = send_nested_bytes(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_ALLOC,
+            &rm_alloc(d.class),
+            &params,
+        );
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl itself succeeds");
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        assert_eq!(
+            u32::from_le_bytes(resp[body + 40..body + 44].try_into().unwrap()),
+            0x56,
+            "NV_ERR_NOT_SUPPORTED in NVOS64.status"
+        );
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
+    }
+
+    /// The older escape, which carries its class inside the parameters. Reading
+    /// the class from the wrong place would miss this route entirely.
+    #[test]
+    fn registering_memory_by_address_through_rm_alloc_memory_is_refused() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let d = osdesc();
+
+        // The wire struct is `nv_ioctl_nvos02_parameters_with_fd`, which is
+        // NVOS02_PARAMETERS followed by the descriptor the allocation may be
+        // made on, so it is longer than the parameters alone and the ABI check
+        // refuses anything else.
+        let want = abi::versions::table_for(abi::version::DriverVersion::new(615, 71, 9))
+            .and_then(|t| abi::versions::lookup(t, abi::ioctl::NV_ESC_RM_ALLOC_MEMORY))
+            .and_then(|e| e.param_size)
+            .expect("the escape has a size in the 615.71.09 profile") as usize;
+        assert!(want >= d.alloc_memory.params_size);
+        let mut p = vec![0u8; want];
+        let at = d.alloc_memory_class_at;
+        p[at..at + 4].copy_from_slice(&d.class.to_le_bytes());
+        p[d.alloc_memory.address_at..d.alloc_memory.address_at + 8]
+            .copy_from_slice(&0xdead_0000u64.to_le_bytes());
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC_MEMORY, &p),
+            &mut resp,
+        );
+        assert_eq!(parse_resp(&resp).status, 0);
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = d.alloc_memory_status_at;
+        assert_eq!(
+            u32::from_le_bytes(resp[body + st..body + st + 4].try_into().unwrap()),
+            0x56
+        );
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
+    }
+
+    /// The heap ioctl is a union: only one of its functions names an address,
+    /// and the function has to be read before anything else in the block means
+    /// what it looks like.
+    #[test]
+    fn registering_memory_by_address_through_the_heap_ioctl_is_refused() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let d = osdesc();
+
+        let mut p = vec![0u8; d.vid_heap.params_size];
+        let f = d.vid_heap_function_at;
+        p[f..f + 4].copy_from_slice(&d.vid_heap_function.to_le_bytes());
+        p[d.vid_heap.address_at..d.vid_heap.address_at + 8]
+            .copy_from_slice(&0x4000_0000u64.to_le_bytes());
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL, &p),
+            &mut resp,
+        );
+        assert_eq!(parse_resp(&resp).status, 0);
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = d.vid_heap_status_at;
+        assert_eq!(
+            u32::from_le_bytes(resp[body + st..body + st + 4].try_into().unwrap()),
+            0x56
+        );
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
+    }
+
+    /// The other side of it. A heap call that allocates in the ordinary way is
+    /// most of what this ioctl is for, and it still goes through -- a refusal
+    /// that caught every function would have taken video memory with it.
+    #[test]
+    fn an_ordinary_heap_call_still_reaches_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let d = osdesc();
+
+        let mut p = vec![0u8; d.vid_heap.params_size];
+        let f = d.vid_heap_function_at;
+        // NVOS32_FUNCTION_ALLOC_SIZE.
+        p[f..f + 4].copy_from_slice(&2u32.to_le_bytes());
+        // And an address pattern where the registration route keeps its own,
+        // to show the function is what decides and not the bytes.
+        p[d.vid_heap.address_at..d.vid_heap.address_at + 8]
+            .copy_from_slice(&0x4000_0000u64.to_le_bytes());
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL, &p),
+            &mut resp,
+        );
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.calls().len(), 1, "host heard {:x?}", host.calls());
+    }
+
+    /// And an allocation of some other class is untouched by any of this.
+    #[test]
+    fn an_allocation_of_another_class_is_not_mistaken_for_a_registration() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_caps(crate::caps::Caps::parse("graphics,video").unwrap());
+        send_alloc(&mut be, h, 0xc7b7, 12);
+        assert_eq!(host.calls().len(), 1, "host heard {:x?}", host.calls());
     }
 
     // ==================================================================

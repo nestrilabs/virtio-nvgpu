@@ -26,6 +26,9 @@ const MAX_GPU: u8 = 8;
 /// cost of it being wrong must not be heap corruption in this process.
 const DEEP_BUF_FLOOR: usize = 64 * 1024;
 
+/// `NVOS64_PARAMETERS.status`, where RM writes its answer to an allocation.
+const NVOS64_STATUS: usize = 40;
+
 const NVOS54_CMD: usize = 8;
 const NVOS54_PARAMS_SIZE: usize = 24;
 const NVOS54_STATUS: usize = 28;
@@ -214,6 +217,11 @@ pub struct NvidiaBackend {
     /// descriptors sit in them. `None` until the release is known, and until
     /// then nothing says what a UVM call even is, so none is served.
     uvm: Option<abi::uvm::Selected>,
+    /// Where the host release keeps the CPU address on each of the three
+    /// routes that let a caller name memory by one. `None` until the release
+    /// is known, and until then those routes are not recognised -- which is
+    /// why nothing is served before a release is known at all.
+    osdesc: Option<abi::osdesc::OsDesc>,
     /// UVM files whose VA space was found to allow pageable access on a
     /// release with no flag to forbid it. The host file is initialised by the
     /// time the answer comes back, so the refusal attaches to the handle.
@@ -334,6 +342,7 @@ impl NvidiaBackend {
             vram: crate::vram::Vram::new(None),
             rmallow: None,
             uvm: None,
+            osdesc: None,
             uvm_denied: std::collections::HashSet::new(),
             allow_refused: std::collections::BTreeMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
@@ -447,6 +456,12 @@ impl NvidiaBackend {
             return Err(format!("host driver {v} has no UVM command table"));
         };
         self.uvm = Some(uvm);
+        // And the routes that name memory by a CPU address, so they can be
+        // recognised and refused. Without the table they would not be.
+        let Some(osdesc) = abi::osdesc::select(v) else {
+            return Err(format!("host driver {v} has no OS-descriptor table"));
+        };
+        self.osdesc = Some(osdesc);
         log::info!(
             "host driver {v}: {} RM controls carry a pointer RM dereferences",
             sel.table.len()
@@ -746,6 +761,7 @@ pub use host::{HostDriver, RealHost};
 mod ioctl;
 mod nested;
 mod open;
+mod osdesc;
 mod resp;
 mod rm_fd;
 mod rmctrl;
