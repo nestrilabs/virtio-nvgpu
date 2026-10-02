@@ -19,3 +19,4 @@ pub mod sandbox;
 pub mod shm;
 pub mod userspace;
 pub mod virtio;
+pub mod vram;

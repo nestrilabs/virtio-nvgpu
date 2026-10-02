@@ -305,6 +305,10 @@ pub struct NvidiaBackend {
     next_mapping_id: u32,
     /// Where forwarded ioctls go. The host driver, except under test.
     host: Box<dyn HostDriver>,
+    /// Video memory charged to this guest, against its limit. See
+    /// `crate::vram`. `Vram::new(None)` is no limit, which is what a VMM that
+    /// never sets one gets.
+    vram: crate::vram::Vram,
 }
 
 /// A placement the guest can hand back, and everything needed to undo it.
@@ -346,6 +350,7 @@ impl NvidiaBackend {
             rmctrl: None,
             caps: crate::caps::Caps::DEFAULT,
             caps_refused: std::collections::BTreeMap::new(),
+            vram: crate::vram::Vram::new(None),
             rmallow: None,
             allow_refused: std::collections::BTreeMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
@@ -395,6 +400,20 @@ impl NvidiaBackend {
 
     pub fn caps(&self) -> crate::caps::Caps {
         self.caps
+    }
+
+    /// Set the guest's video-memory budget. `None` is no limit.
+    pub fn set_vram_limit_mib(&mut self, mib: Option<u64>) {
+        self.vram = crate::vram::Vram::new(mib);
+    }
+
+    /// The budget this backend enforces, in MiB; 0 when there is none.
+    ///
+    /// Announced in device config, where the VMM compares it against what it
+    /// was configured with, so a backend that is not enforcing that limit
+    /// cannot go unnoticed. The guest is not told.
+    pub fn vram_limit_mib(&self) -> u64 {
+        self.vram.limit_mib()
     }
 
     /// Count a refusal for want of a capability, and say which one once.

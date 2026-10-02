@@ -148,9 +148,10 @@ pub const FEATURE_RMCTRL_SEGMENTS: u32 = 1 << 0;
 
 /// Device configuration space.
 ///
-/// Mirrors `struct virtio_gpu_nv_config`, which the driver asserts is 4016
-/// bytes with `num_fd_translations` at offset 3880, and which must fit in one
-/// page.
+/// Mirrors `struct virtio_gpu_nv_config` up to 4016 bytes, which the driver
+/// asserts, with `num_fd_translations` at offset 3880. The guest reads no
+/// further: `vram_limit_mib` after it is for the VMM. The whole must fit in
+/// one page.
 ///
 /// This replaced a 24-byte struct whose first field was `num_gpus`. The driver
 /// reads `num_gpus` from offset 32 and rejects zero, so it read past the end of
@@ -178,6 +179,16 @@ pub struct VirtioGpuNvConfig {
     /// it and the struct's layout does not change.
     pub features: u32,
     pub fd_translations: [FdTranslation; MAX_FD_TRANSLATIONS],
+    /// The video memory limit this backend enforces, in MiB; 0 for none.
+    ///
+    /// Announced so the VMM can refuse to start a guest whose backend is not
+    /// enforcing the limit the VMM was configured with: a limit is a flag on
+    /// a process the VMM did not start, and a missing flag would otherwise be
+    /// a guest with the whole card. Appended, so a backend from before it
+    /// serves 4016 bytes and a VMM reads the absence as 0. The guest driver
+    /// never reads it: a VMM from before it exposes 4016 bytes, and a guest
+    /// read past those BUGs in virtio_cread_bytes.
+    pub vram_limit_mib: u64,
 }
 
 impl Default for VirtioGpuNvConfig {
@@ -191,6 +202,7 @@ impl Default for VirtioGpuNvConfig {
             num_fd_translations: 0,
             features: 0,
             fd_translations: [FdTranslation::default(); MAX_FD_TRANSLATIONS],
+            vram_limit_mib: 0,
         }
     }
 }
@@ -201,9 +213,15 @@ impl VirtioGpuNvConfig {
     /// More than [`MAX_GPUS`] are truncated: the driver reads no further, so
     /// advertising a count it cannot index would point it at slots that were
     /// never written.
-    pub fn new(driver_version: &str, gpus: &[GpuSlot], caps: crate::caps::Caps) -> Self {
+    pub fn new(
+        driver_version: &str,
+        gpus: &[GpuSlot],
+        caps: crate::caps::Caps,
+        vram_limit_mib: u64,
+    ) -> Self {
         let mut cfg = Self::default();
         cfg.caps = caps.bits();
+        cfg.vram_limit_mib = vram_limit_mib;
         cfg.features = FEATURE_RMCTRL_SEGMENTS;
         let v = driver_version.as_bytes();
         let n = v.len().min(DRIVER_VERSION_LEN - 1);
@@ -270,7 +288,9 @@ mod tests {
     #[test]
     fn layout_matches_the_guest_driver() {
         assert_eq!(size_of::<GpuSlot>(), 476, "gpu_slot size mismatch");
-        assert_eq!(size_of::<VirtioGpuNvConfig>(), 4016, "config size mismatch");
+        assert_eq!(size_of::<VirtioGpuNvConfig>(), 4024, "config size mismatch");
+        // Where the guest driver's struct ends; it reads nothing past here.
+        assert_eq!(offset_of!(VirtioGpuNvConfig, vram_limit_mib), 4016);
         assert_eq!(
             offset_of!(VirtioGpuNvConfig, num_fd_translations),
             3880,
@@ -316,7 +336,7 @@ mod tests {
     #[test]
     fn one_gpu_is_described_where_the_driver_looks() {
         let slot = GpuSlot::new("0000:01:00.0", 0, "Model: NVIDIA RTX A2000");
-        let cfg = VirtioGpuNvConfig::new("615.71.09", &[slot], crate::caps::Caps::DEFAULT);
+        let cfg = VirtioGpuNvConfig::new("615.71.09", &[slot], crate::caps::Caps::DEFAULT, 0);
         let bytes = cfg.as_bytes();
 
         assert_eq!(&bytes[0..9], b"615.71.09");
@@ -350,7 +370,7 @@ mod tests {
         let many: Vec<_> = (0..12)
             .map(|i| GpuSlot::new(&format!("0000:0{i}:00.0"), i, ""))
             .collect();
-        let cfg = VirtioGpuNvConfig::new("615.71.09", &many, crate::caps::Caps::DEFAULT);
+        let cfg = VirtioGpuNvConfig::new("615.71.09", &many, crate::caps::Caps::DEFAULT, 0);
         let n = cfg.num_gpus;
         assert_eq!(
             n as usize, MAX_GPUS,
@@ -361,8 +381,8 @@ mod tests {
     #[test]
     fn a_read_past_the_end_is_clamped_rather_than_panicking() {
         let cfg = VirtioGpuNvConfig::default();
-        assert_eq!(cfg.read(4004, 64).len(), 12);
+        assert_eq!(cfg.read(4012, 64).len(), 12);
         assert!(cfg.read(99_999, 16).is_empty());
-        assert_eq!(cfg.read(0, 4016).len(), 4016);
+        assert_eq!(cfg.read(0, 4024).len(), 4024);
     }
 }

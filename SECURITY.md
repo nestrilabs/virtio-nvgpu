@@ -47,6 +47,25 @@ These hold on this branch.
 | release drift | on a host with no pointer table of its own, every control any release describes a pointer in that the selected table does not; the backend does not start when no table covers the release at all |
 | half-sent buffers | a control whose pointer RM reads and whose bytes the guest did not send, or sent a different number of; refused rather than served with zeroes |
 | undescribed controls | a control whose embedded pointers the generated table cannot describe, including one RM compiles in only under a build flag; refused with NV_ERR_NOT_SUPPORTED |
+| RM privilege | an RM control or class RM does not serve to an unprivileged caller. RM applies its rule to whoever called it, and here that is the backend, not the guest -- so the backend applies RM's rule itself, from RM's own tables, before forwarding. All four of RM's dispatch paths are covered: the exported-method flags, the deprecated table (by the privilege of the command each one is rewritten into), the commands RM forwards to GSP firmware (by the bit RM tests in the command number), and a class whose control is a passthrough (by the privilege of the class) |
+| the host, through RM | eight controls RM itself marks non-privileged and this backend refuses regardless: the host's process list through the GPU (GET_PIDS, GET_PID_INFO), GPU accounting state and the pids it recorded, and the two that let a caller rename itself inside the backend's client or switch off USERD isolation. On a host these answer a local user about their own machine; here they answer a guest about someone else's |
+| oversized parameters | a parameter block larger than RM will copy for an unprivileged caller, on the paths where RM reads no struct and so declares no size. 535.129.03 applies no ceiling of its own there; the backend applies one anyway |
+
+The RM privilege row rests on RM's tables and on nothing written by hand: the
+generator reads each release's own flag values, parses its deprecated-control
+table and the command each converter rewrites into, and asserts the shape of
+RM's two privilege checks and of the dispatch order itself. If any of them
+changes it stops rather than carry on with a rule that no longer describes the
+driver. The numbers differ by release often enough that this is not caution:
+535.129.03 numbers the control flags differently from 615.71.09, carries an
+extra column in the deprecated table, and caps a GSP-forwarded parameter block
+at nothing at all.
+
+The rule never asks whether a privileged bit is clear. RMCTRL_FLAGS_KERNEL_-
+PRIVILEGED and RS_FLAGS_NONE are both zero, so an entry with no bits set is the
+most privileged thing in RM's table rather than the least -- 32 controls in
+615.71.09 are exactly that. Everything tests for the non-privileged bit being
+set.
 
 The embedded-pointer rows hold for a host release with a table of its own
 (535.129.03, 580.178.04, 595.71.05, 595.104.02, 615.71.09) and for one between
@@ -86,7 +105,7 @@ model. The comparison, item by item:
 | | nvproxy | virtio-nvgpu |
 |---|---|---|
 | host kernel exposure from general code | gVisor's Sentry, behind a seccomp filter | a guest kernel under KVM |
-| which ioctls reach the driver | an allowlist per driver release | an ABI profile per release; an RM allowlist is not built |
+| which ioctls reach the driver | an allowlist per driver release | an ABI profile per release, and an RM allowlist generated from RM's own privilege tables |
 | process confining the forwarder | seccomp | seccomp and Landlock, entered before the first thread |
 | driver bugs in forwarded calls | not mitigated | not mitigated |
 | DMA buffer validation | none | none |

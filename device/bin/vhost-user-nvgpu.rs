@@ -65,6 +65,12 @@ struct Args {
     /// utility. Compute (CUDA, through nvidia-uvm) is off unless named.
     #[arg(long, default_value_t = Caps::DEFAULT, value_parser = Caps::parse)]
     caps: Caps,
+
+    /// Video memory the guest may hold, in MiB. Omitted, it may take the
+    /// whole card. The limit is announced in device config, so a VMM given
+    /// one refuses to start a guest on a backend that is not enforcing it.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    vram_limit_mib: Option<u64>,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -316,7 +322,7 @@ impl NvGpuBackend {
     /// The guest driver rejects `num_gpus == 0`, so a host with no NVIDIA
     /// module loaded is refused here, where the reason can be stated, rather
     /// than in a guest as a bare -EINVAL from probe.
-    fn new(proc_nvidia: &Path, caps: Caps) -> anyhow::Result<Self> {
+    fn new(proc_nvidia: &Path, caps: Caps, vram_limit_mib: Option<u64>) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
                 "no NVIDIA driver version at {} -- is the kernel module loaded?",
@@ -337,7 +343,9 @@ impl NvGpuBackend {
             .set_host_driver_version(release)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
         nvidia.set_caps(caps);
+        nvidia.set_vram_limit_mib(vram_limit_mib);
 
+        let nvidia_vram_mib = nvidia.vram_limit_mib();
         Ok(Self {
             nvidia: Arc::new(Mutex::new(nvidia)),
             mem: None,
@@ -345,7 +353,7 @@ impl NvGpuBackend {
             // Phase A forwards ioctls only. nvidia-smi needs no mapping at all
             // -- 100 ioctls and one mmap in the captured trace -- so a guest
             // can enumerate the GPU before the shared window exists.
-            config: VirtioGpuNvConfig::new(&version, &gpus, caps),
+            config: VirtioGpuNvConfig::new(&version, &gpus, caps, nvidia_vram_mib),
             watches: None,
             req: Vec::new(),
             resp: vec![0u8; RESP_MAX],
@@ -602,14 +610,19 @@ fn main() -> anyhow::Result<()> {
     );
 
     log::info!(
-        "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}",
+        "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}, {}",
         args.socket,
-        args.caps
+        args.caps,
+        match args.vram_limit_mib {
+            Some(m) => format!("video memory limited to {m} MiB"),
+            None => "no video memory limit".to_string(),
+        }
     );
 
     let backend = Arc::new(RwLock::new(NvGpuBackend::new(
         &args.proc_nvidia,
         args.caps,
+        args.vram_limit_mib,
     )?));
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
