@@ -41,6 +41,8 @@ These hold on this branch.
 | capabilities | device nodes and RM classes outside `--caps`: `nvidia-uvm` without compute, `nvidia-modeset` and render nodes without graphics, 3D classes without graphics, NVENC, NVDEC, NVJPG and OFA classes without video |
 | UVM tools | `nvidia-uvm-tools`, under every capability |
 | UVM init | the guest's UVM_INITIALIZE flags; the backend sends its own, with HMM off and sharing mode on, and pageable access off where the release has the flag |
+| embedded pointers | a guest address in a pointer RM dereferences inside an RM control's parameters: the backend supplies every such buffer itself, sized from the count in the guest's own block and bounded at 1 MiB per pointer and 2 MiB per call |
+| undescribed controls | a control whose embedded pointers the generated table cannot describe, including one RM compiles in only under a build flag; refused with NV_ERR_NOT_SUPPORTED |
 
 There is no command-line flag that switches any of these off.
 
@@ -55,9 +57,6 @@ These are open on this branch. Until they land, treat a guest as able to reach
 the backend process itself, and treat the backend as able to reach everything
 its user can.
 
-- Embedded pointers in RM controls. Some RM controls carry pointers that the
-  host driver follows. The backend does not yet supply every one of them
-  itself. In progress.
 - An RM allowlist. RM controls and classes inside a capability are forwarded
   without a per-release list of what is safe to expose.
 - A sandbox for the backend. Landlock and seccomp confinement is in progress.

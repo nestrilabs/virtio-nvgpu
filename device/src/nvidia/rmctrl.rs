@@ -51,10 +51,27 @@ pub(super) struct Slot {
 /// Pure: it reads the guest's block and the table and decides. Everything that
 /// allocates or copies is in [`Embedded::install`], so the decisions can be
 /// tested without a host driver.
+/// What the guest sent for one pointer, from either encoding.
+///
+/// A guest from v0.1 describes one pointer in the request struct itself; a
+/// v0.2 guest sends a segment per pointer. Both are read here, so a backend
+/// ahead of the guest module in a rootfs serves the call rather than refusing
+/// it -- which is a stale image, the commonest thing to have, and it used to
+/// show up as a Vulkan error several layers from the cause.
+fn sent<'b>(
+    segs: Option<Segments<'b>>,
+    legacy: Option<(usize, &'b [u8])>,
+    ptr_offset: usize,
+) -> Option<&'b [u8]> {
+    segs.and_then(|s| s.find(ptr_offset as u32))
+        .or_else(|| legacy.filter(|(off, _)| *off == ptr_offset).map(|(_, b)| b))
+}
+
 pub(super) fn plan(
     entry: &RmCtrlEntry,
     params: &[u8],
     segs: Option<Segments<'_>>,
+    legacy: Option<(usize, &[u8])>,
 ) -> Result<Vec<Slot>, u32> {
     if entry.refuse {
         return Err(NV_ERR_NOT_SUPPORTED);
@@ -97,8 +114,8 @@ pub(super) fn plan(
             // More bytes than the length says means the guest and this table
             // disagree about the layout, which is not something to resolve by
             // taking the smaller number.
-            if let Some(sent) = segs.and_then(|s| s.find(p.ptr_offset as u32))
-                && sent.len() > len
+            if let Some(bytes) = sent(segs, legacy, p.ptr_offset)
+                && bytes.len() > len
             {
                 return Err(NV_ERR_NOT_SUPPORTED);
             }
@@ -120,7 +137,7 @@ pub(super) fn plan(
 /// agreement check rather than a limit. It disagreeing means the two halves
 /// read the call differently, and the call is refused rather than answered
 /// with a piece of what RM produced.
-pub(super) fn reply_fits(slots: &[Slot], have: usize) -> bool {
+pub(super) fn reply_fits(slots: &[Slot], have: usize, segmented: bool) -> bool {
     let lens: Vec<usize> = slots
         .iter()
         .filter(|s| s.copy_out && s.len > 0)
@@ -130,6 +147,11 @@ pub(super) fn reply_fits(slots: &[Slot], have: usize) -> bool {
         // Nothing goes back this way, so a guest that sent no deep block at
         // all -- every pointer null, as a sizing call makes them -- is fine.
         return true;
+    }
+    if !segmented {
+        // A v0.1 guest copies the deep block straight back to its one pointer,
+        // so there can be only one buffer and it goes back raw.
+        return lens.len() == 1 && lens[0] <= have;
     }
     protocol::segments::encoded_len(&lens).is_some_and(|n| n <= have)
 }
@@ -149,6 +171,7 @@ impl<'a> Embedded<'a> {
         slots: &[Slot],
         params: &mut [u8],
         segs: Option<Segments<'_>>,
+        legacy: Option<(usize, &[u8])>,
         pool: &'a std::cell::RefCell<GuardPool>,
     ) -> Result<Self, u32> {
         let mut bufs = Vec::with_capacity(slots.len());
@@ -161,9 +184,9 @@ impl<'a> Embedded<'a> {
             buf.as_mut_slice().fill(0);
 
             if slot.copy_in {
-                if let Some(sent) = segs.and_then(|s| s.find(slot.ptr_offset as u32)) {
+                if let Some(bytes) = sent(segs, legacy, slot.ptr_offset) {
                     // `plan` refused anything longer than the slot.
-                    buf.as_mut_slice()[..sent.len()].copy_from_slice(sent);
+                    buf.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
                 } else if slot.len > 0 {
                     // The guest never sent the bytes: an older guest, or one
                     // that does not describe this pointer. RM reads zeroes
@@ -245,7 +268,7 @@ mod tests {
         let e = entry(LIST, 16);
         let p = block(16, 3, 8);
         assert_eq!(
-            plan(&e, &p, None).unwrap(),
+            plan(&e, &p, None, None).unwrap(),
             vec![Slot {
                 ptr_offset: 8,
                 len: 24,
@@ -263,13 +286,13 @@ mod tests {
             ptrs: &[],
             refuse: true,
         };
-        assert_eq!(plan(&e, &[0u8; 64], None), Err(NV_ERR_NOT_SUPPORTED));
+        assert_eq!(plan(&e, &[0u8; 64], None, None), Err(NV_ERR_NOT_SUPPORTED));
     }
 
     #[test]
     fn a_block_shorter_than_the_release_struct_is_refused() {
         let e = entry(LIST, 16);
-        assert_eq!(plan(&e, &[0u8; 12], None), Err(NV_ERR_NOT_SUPPORTED));
+        assert_eq!(plan(&e, &[0u8; 12], None, None), Err(NV_ERR_NOT_SUPPORTED));
     }
 
     /// The count is a guest's number. This is the case the table exists for.
@@ -277,7 +300,7 @@ mod tests {
     fn an_enormous_count_is_refused_rather_than_allocated() {
         let e = entry(LIST, 16);
         let p = block(16, u32::MAX, 8);
-        assert_eq!(plan(&e, &p, None), Err(NV_ERR_NOT_SUPPORTED));
+        assert_eq!(plan(&e, &p, None, None), Err(NV_ERR_NOT_SUPPORTED));
     }
 
     #[test]
@@ -285,7 +308,7 @@ mod tests {
         let e = entry(LIST, 16);
         let mut p = block(16, 3, 8);
         p[8..16].fill(0);
-        assert_eq!(plan(&e, &p, None).unwrap(), vec![]);
+        assert_eq!(plan(&e, &p, None, None).unwrap(), vec![]);
     }
 
     #[test]
@@ -295,7 +318,7 @@ mod tests {
         let mut wire = [0u8; 64];
         let n = protocol::segments::encode(&mut wire, &[(8, &[7u8; 16])]).unwrap();
         let s = Segments::parse(&wire[..n]).unwrap();
-        assert_eq!(plan(&e, &p, Some(s)), Err(NV_ERR_NOT_SUPPORTED));
+        assert_eq!(plan(&e, &p, Some(s), None), Err(NV_ERR_NOT_SUPPORTED));
     }
 
     /// Several pointers, each with its own count, is the shape that one
@@ -325,7 +348,7 @@ mod tests {
         let mut p = block(32, 10, 8);
         p[24..32].copy_from_slice(&0xcafe_u64.to_le_bytes());
 
-        let slots = plan(&e, &p, None).unwrap();
+        let slots = plan(&e, &p, None, None).unwrap();
         assert_eq!(slots.len(), 2);
         assert_eq!(slots[0].len, 10);
         assert!(slots[0].copy_in && !slots[0].copy_out);
@@ -344,8 +367,8 @@ mod tests {
         let n = protocol::segments::encode(&mut wire, &[(8, &[1u8, 2, 3, 4])]).unwrap();
         let s = Segments::parse(&wire[..n]).unwrap();
 
-        let slots = plan(&e, &p, Some(s)).unwrap();
-        let emb = Embedded::install(&slots, &mut p, Some(s), &pool).unwrap();
+        let slots = plan(&e, &p, Some(s), None).unwrap();
+        let emb = Embedded::install(&slots, &mut p, Some(s), None, &pool).unwrap();
 
         // The field now holds an address of ours, not the guest's.
         let host = u64::from_le_bytes(p[8..16].try_into().unwrap());
@@ -363,24 +386,49 @@ mod tests {
         assert_eq!(&p[8..16], &guest[..]);
     }
 
+    /// A guest module from v0.1 sends one pointer in the request struct. The
+    /// bytes still reach RM, and the buffer is still the backend's.
+    #[test]
+    fn the_old_single_pointer_encoding_is_read_as_a_segment() {
+        let pool = std::cell::RefCell::new(GuardPool::default());
+        let e = entry(LIST, 16);
+        let mut p = block(16, 2, 8);
+        let guest_bytes = [5u8, 6, 7, 8];
+
+        let slots = plan(&e, &p, None, Some((8, &guest_bytes))).unwrap();
+        assert_eq!(slots[0].len, 16);
+        let emb = Embedded::install(&slots, &mut p, None, Some((8, &guest_bytes)), &pool).unwrap();
+        assert_eq!(&emb.reply()[0].1[..4], &guest_bytes);
+
+        // Bytes offered for a pointer the control does not have are ignored.
+        let mut p2 = block(16, 2, 8);
+        let slots = plan(&e, &p2, None, Some((999, &guest_bytes))).unwrap();
+        let emb =
+            Embedded::install(&slots, &mut p2, None, Some((999, &guest_bytes)), &pool).unwrap();
+        assert_eq!(emb.reply()[0].1, &[0u8; 16]);
+    }
+
     #[test]
     fn a_sizing_call_needs_no_room_and_a_short_reply_does_not_fit() {
-        assert!(reply_fits(&[], 0));
+        assert!(reply_fits(&[], 0, true));
         let out = Slot {
             ptr_offset: 8,
             len: 64,
             copy_in: false,
             copy_out: true,
         };
-        assert!(!reply_fits(&[out], 8));
-        assert!(reply_fits(&[out], 1024));
+        assert!(!reply_fits(&[out], 8, true));
+        assert!(reply_fits(&[out], 1024, true));
+        // Unsegmented, the one buffer goes back raw and needs only its own room.
+        assert!(reply_fits(&[out], 64, false));
+        assert!(!reply_fits(&[out], 63, false));
         // A pointer RM never writes back needs no room either.
         let inp = Slot {
             copy_out: false,
             copy_in: true,
             ..out
         };
-        assert!(reply_fits(&[inp], 0));
+        assert!(reply_fits(&[inp], 0, true));
     }
 
     #[test]
@@ -400,8 +448,8 @@ mod tests {
         let n = protocol::segments::encode(&mut wire, &[(8, &[0xffu8; 8])]).unwrap();
         let s = Segments::parse(&wire[..n]).unwrap();
 
-        let slots = plan(&e, &p, Some(s)).unwrap();
-        let emb = Embedded::install(&slots, &mut p, Some(s), &pool).unwrap();
+        let slots = plan(&e, &p, Some(s), None).unwrap();
+        let emb = Embedded::install(&slots, &mut p, Some(s), None, &pool).unwrap();
         assert_eq!(emb.reply()[0].1, &[0u8; 8]);
     }
 }

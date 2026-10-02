@@ -49,6 +49,7 @@
 #include "gen/nvgpu_rmalloc_classes.h"
 #include "gen/nvgpu_v1v2_rewrites.h"
 #include "nvgpu_rm_intercepts.h"
+#include "nvgpu_rmctrl.h"
 
 /*
  * module_kset lives in kernel/module/sysfs.c and is NOT exported to modules,
@@ -138,6 +139,13 @@ struct nvgpu_open_resp {
 
 /* Largest second-level buffer we will carry for one call. */
 #define NVGPU_DEEP_MAX (64 * 1024)
+
+/*
+ * deep_ptr_offset when the deep block is a segment table rather than one
+ * pointer's worth of bytes. See protocol::segments: a parameter block is a few
+ * hundred bytes at most, so no real offset comes near this.
+ */
+#define NVGPU_DEEP_SEGMENTED 0xffffffffu
 
 /*
  * The largest nvidia-drm GEM parameter struct this driver forwards, and the
@@ -484,6 +492,11 @@ struct nvgpu_device {
 
   /* Config read from VMM */
   char driver_version[32];
+  /* RM controls whose parameters carry a pointer RM dereferences, for this
+   * host release. NULL when none covers it: the backend then refuses every
+   * such control, and this half sends no segments for them.
+   */
+  const struct nvgpu_rmctrl_table *rmctrl;
   u32 num_gpus;
   u32 caps;
   /* caps was 0: a backend that predates them, served as v0.1 was. */
@@ -1502,6 +1515,22 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   u32 deep_ptr_offset = 0;
   u32 deep_len = 0;
 
+  /*
+   * Pointers RM dereferences inside the parameter block, one segment each.
+   *
+   * The caller's own address is recorded here and never sent: the backend is
+   * given the bytes and gives RM a buffer of its own. What comes back is
+   * matched to one of these by offset, so a reply can only ever be written to
+   * an address this call read out of the caller's own block.
+   */
+  struct {
+    u32 off;
+    u32 len;
+    u64 user;
+    bool copy_in;
+  } seg[NVGPU_RMCTRL_MAX_SEGMENTS];
+  int nseg = 0;
+
   void *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
@@ -1530,6 +1559,75 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   }
 
   /*
+   * Pointers RM dereferences inside this control's parameters.
+   *
+   * RM copies through an NvP64 in the parameter block of the controls
+   * `nvgpu_rmctrl.h` lists, from the caller's address space -- which, through
+   * this device, is the backend's. So the address never travels: what it
+   * addresses does, as one segment per pointer, and the backend gives RM a
+   * buffer of its own at a length it derives from the same count field in
+   * these same parameters.
+   */
+  {
+    const struct nvgpu_rmctrl_entry *ent =
+        nvgpu_rmctrl_find(nfd->dev->rmctrl, ctl_cmd);
+    int i = 0;
+
+    if (ent && !ent->refuse && user_nested && nested_size >= ent->params_size &&
+        ent->ptr_count > 0 && ent->ptr_count <= NVGPU_RMCTRL_MAX_SEGMENTS) {
+      void *pbuf = kmalloc(nested_size, GFP_KERNEL);
+      u32 total = 8 + 8 * (u32)ent->ptr_count;
+
+      if (!pbuf)
+        return -ENOMEM;
+      if (copy_from_user(pbuf, user_nested, nested_size)) {
+        kfree(pbuf);
+        return -EFAULT;
+      }
+
+      for (i = 0; i < ent->ptr_count; i++) {
+        const struct nvgpu_rmctrl_ptr *p =
+            &nfd->dev->rmctrl->ptrs[ent->ptr_first + i];
+        u64 up;
+        long len;
+
+        if (p->ptr_offset + sizeof(u64) > nested_size)
+          break;
+        memcpy(&up, (u8 *)pbuf + p->ptr_offset, sizeof(up));
+        if (!up)
+          continue; /* null is RM's own "nothing to copy" */
+
+        len = nvgpu_rmctrl_len(p, pbuf, nested_size);
+        if (len < 0 || total + ALIGN((u32)len, 8) > NVGPU_RMCTRL_MAX_TOTAL)
+          break;
+
+        seg[nseg].off = p->ptr_offset;
+        seg[nseg].len = (u32)len;
+        seg[nseg].user = up;
+        seg[nseg].copy_in = p->copy_in;
+        total += ALIGN((u32)len, 8);
+        nseg++;
+      }
+      kfree(pbuf);
+
+      /*
+       * A pointer this half could not describe means the two halves read the
+       * call differently. Sending some of the segments would have the backend
+       * size a buffer for one pointer and not another, so none go: the backend
+       * reads the same count from the same field, refuses the control, and the
+       * caller gets NV_ERR_NOT_SUPPORTED rather than half an answer.
+       */
+      if (i < ent->ptr_count)
+        nseg = 0;
+      if (nseg > 0) {
+        deep_len = total;
+        deep_ptr_offset = NVGPU_DEEP_SEGMENTED;
+      }
+    }
+  }
+
+
+  /*
    * A second-level pointer, carried rather than rewritten.
    *
    * Some parameter blocks hold an NvP64 pointing at a buffer of the caller's.
@@ -1547,8 +1645,9 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
    * the pointer sits and how much it addresses. Both are properties of the
    * layout that carries the pointer, which is the stable one.
    */
-  rw = (user_nested && nested_size > 0) ? nvgpu_find_deep_rewrite(ctl_cmd)
-                                        : NULL;
+  rw = (user_nested && nested_size > 0 && nseg == 0)
+           ? nvgpu_find_deep_rewrite(ctl_cmd)
+           : NULL;
 
   if (rw && nested_size >= rw->v1_userptr_offset + 8) {
     void *pbuf = kmalloc(nested_size, GFP_KERNEL);
@@ -1643,7 +1742,33 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
 
-  if (deep_len > 0) {
+  if (nseg > 0) {
+    u8 *d = req_buf + sizeof(*req) + sizeof(params) + nested_size;
+    u32 at = 8 + 8 * (u32)nseg;
+    __le32 v;
+    int i;
+
+    memset(d, 0, deep_len);
+    v = cpu_to_le32((u32)nseg);
+    memcpy(d, &v, sizeof(v));
+    for (i = 0; i < nseg; i++) {
+      v = cpu_to_le32(seg[i].off);
+      memcpy(d + 8 + i * 8, &v, sizeof(v));
+      v = cpu_to_le32(seg[i].len);
+      memcpy(d + 8 + i * 8 + 4, &v, sizeof(v));
+
+      /* Only what RM reads is sent. A buffer it merely writes goes as zeroes
+       * and comes back with its answer in it.
+       */
+      if (seg[i].copy_in && seg[i].len &&
+          copy_from_user(d + at, (const void __user *)seg[i].user,
+                         seg[i].len)) {
+        ret = -EFAULT;
+        goto out;
+      }
+      at += ALIGN(seg[i].len, 8);
+    }
+  } else if (deep_len > 0) {
     if (copy_from_user(req_buf + sizeof(*req) + sizeof(params) + nested_size,
                        (const void __user *)deep_user_ptr, deep_len)) {
       ret = -EFAULT;
@@ -1675,7 +1800,44 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
       ret = -EFAULT;
   }
 
-  if (deep_len > 0 && le32_to_cpu(resp->deep_len) > 0) {
+  if (nseg > 0 && le32_to_cpu(resp->deep_len) >= 8) {
+    const u8 *d = resp_buf + sizeof(*resp) + sizeof(params) +
+                  le32_to_cpu(resp->nested_len);
+    u32 have = min(deep_len, le32_to_cpu(resp->deep_len));
+    u32 at, n;
+    __le32 v;
+    u32 i;
+
+    memcpy(&v, d, sizeof(v));
+    n = le32_to_cpu(v);
+    if (n > NVGPU_RMCTRL_MAX_SEGMENTS || 8 + 8 * n > have)
+      n = 0;
+    at = 8 + 8 * n;
+
+    for (i = 0; i < n; i++) {
+      u32 off, len;
+      int j;
+
+      memcpy(&v, d + 8 + i * 8, sizeof(v));
+      off = le32_to_cpu(v);
+      memcpy(&v, d + 8 + i * 8 + 4, sizeof(v));
+      len = le32_to_cpu(v);
+      if (len > have || at + len > have)
+        break;
+
+      /* Only to an address this call read out of the caller's own parameter
+       * block, and only as far as the length this half computed for it.
+       */
+      for (j = 0; j < nseg; j++) {
+        if (seg[j].off == off && seg[j].user && len <= seg[j].len) {
+          if (copy_to_user((void __user *)seg[j].user, d + at, len))
+            ret = -EFAULT;
+          break;
+        }
+      }
+      at += ALIGN(len, 8);
+    }
+  } else if (deep_len > 0 && le32_to_cpu(resp->deep_len) > 0) {
     u32 copy_back = min(deep_len, le32_to_cpu(resp->deep_len));
     if (copy_to_user((void __user *)deep_user_ptr,
                      resp_buf + sizeof(*resp) + sizeof(params) +
@@ -4419,6 +4581,12 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   /* Read config space written by the VMM at device creation */
   virtio_cread_bytes(vdev, 0, dev->driver_version, 32);
   dev->driver_version[31] = '\0';
+  dev->rmctrl = nvgpu_rmctrl_table_for(dev->driver_version);
+  if (!dev->rmctrl)
+    dev_warn(&vdev->dev,
+             "no RM pointer table for host driver %s; controls whose "
+             "parameters carry a pointer will be refused\n",
+             dev->driver_version);
   virtio_cread(vdev, struct virtio_gpu_nv_config, num_gpus, &dev->num_gpus);
   virtio_cread(vdev, struct virtio_gpu_nv_config, caps, &dev->caps);
 

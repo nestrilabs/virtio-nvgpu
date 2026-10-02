@@ -45,6 +45,25 @@ impl NvidiaBackend {
 
         let escape = (request & 0xFF) as u32;
 
+        // NVOS64 carries a second pointer: `pRightsRequested`, an access mask
+        // RM reads from the caller's address space when it is not null. The
+        // guest's value there is an address in this process, and nothing in
+        // this project asks for rights, so the host sees null and the caller
+        // gets its own value back.
+        const NVOS64_RIGHTS: usize = 24;
+        let rights = if escape == 0x2b && outer.len() >= NVOS64_RIGHTS + 8 {
+            let saved: [u8; 8] = outer[NVOS64_RIGHTS..NVOS64_RIGHTS + 8]
+                .try_into()
+                .expect("just checked the length");
+            if saved != [0u8; 8] {
+                log::debug!("RM_ALLOC: pRightsRequested sent as null, not the guest's value");
+            }
+            outer[NVOS64_RIGHTS..NVOS64_RIGHTS + 8].fill(0);
+            Some(saved)
+        } else {
+            None
+        };
+
         // Log RM_CONTROL/RM_ALLOC for debugging Vulkan init
         if escape == 0x2A && outer.len() >= 12 {
             let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
@@ -242,12 +261,17 @@ impl NvidiaBackend {
             } else {
                 None
             };
+            // A guest from v0.1 describes one pointer in the request struct
+            // instead of sending a segment table. It is read as the segment it
+            // is, so a backend ahead of the module in a rootfs still serves
+            // the call.
+            let legacy = deep_in.filter(|(off, _)| *off as u32 != protocol::segments::SEGMENTED);
             let mut embedded: Option<rmctrl::Embedded> = None;
             if let Some(entry) = described {
                 let have = deep_in.map(|(_, b)| b.len()).unwrap_or(0);
-                let refused = match rmctrl::plan(entry, host_buf, segs) {
+                let refused = match rmctrl::plan(entry, host_buf, segs, legacy) {
                     Err(status) => Some(status),
-                    Ok(slots) if !rmctrl::reply_fits(&slots, have) => {
+                    Ok(slots) if !rmctrl::reply_fits(&slots, have, segs.is_some()) => {
                         log::warn!(
                             "RM_CONTROL cmd={:#010x}: the guest left {have} bytes for what RM \
                              writes back, which does not hold it",
@@ -256,7 +280,13 @@ impl NvidiaBackend {
                         Some(rmctrl::NV_ERR_NOT_SUPPORTED)
                     }
                     Ok(slots) => {
-                        match rmctrl::Embedded::install(&slots, host_buf, segs, &self.guards) {
+                        match rmctrl::Embedded::install(
+                            &slots,
+                            host_buf,
+                            segs,
+                            legacy,
+                            &self.guards,
+                        ) {
                             Ok(e) => {
                                 embedded = Some(e);
                                 None
@@ -404,6 +434,9 @@ impl NvidiaBackend {
 
             // The caller's own pointer value goes back, not ours and not zero.
             outer[ptr_offset..ptr_offset + 8].copy_from_slice(&caller_ptr);
+            if let Some(saved) = rights {
+                outer[NVOS64_RIGHTS..NVOS64_RIGHTS + 8].copy_from_slice(&saved);
+            }
 
             // Build response: outer + updated nested params + what the
             // pointer inside them addresses.
@@ -421,6 +454,12 @@ impl NvidiaBackend {
                 let out = e.reply();
                 if out.is_empty() {
                     deep_reply = 0;
+                } else if segs.is_none() {
+                    // A v0.1 guest copies the deep block straight back to its
+                    // one pointer, so it goes back raw. `reply_fits` allowed
+                    // this only for a single buffer that fits.
+                    deep_buf = out[0].1.to_vec();
+                    deep_reply = deep_buf.len();
                 } else {
                     deep_buf = vec![0u8; deep_reply];
                     if protocol::segments::encode(&mut deep_buf, &out).is_none() {
@@ -467,6 +506,9 @@ impl NvidiaBackend {
             // Same here: restore what the caller passed, in case the host
             // driver wrote to the field.
             outer[ptr_offset..ptr_offset + 8].copy_from_slice(&caller_ptr);
+            if let Some(saved) = rights {
+                outer[NVOS64_RIGHTS..NVOS64_RIGHTS + 8].copy_from_slice(&saved);
+            }
             self.write_ioctl_resp(resp_buf, cookie, &outer)
         }
     }
