@@ -1,8 +1,9 @@
 # Keeps one draft release up to date with every commit since the last
 # published release: "- <commit title> (@author)", oldest first.
 #
-# To release: open the draft, change the tag if the guessed one is wrong,
-# write anything extra ABOVE the marker line, publish. Text above the marker
+# The tag is v<version> from VERSION_FROM, a Cargo.toml: bump it there, in
+# the PR that makes the release, and the draft follows. To release: open the
+# draft, write anything extra ABOVE the marker line, publish. Text above the marker
 # survives every rewrite; everything below it is regenerated on each push.
 name: Draft release
 
@@ -31,6 +32,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
+          VERSION_FROM: Cargo.toml
         run: |
           set -euo pipefail
           marker='<!-- everything below is rewritten on every push; write above this line -->'
@@ -66,9 +68,6 @@ jobs:
 
           if [ -n "$draft" ]; then
             old=$(gh api "repos/$REPO/releases/$draft" --jq '.body // ""')
-            # A PATCH without tag_name leaves a draft untagged, so send the
-            # one it has: a tag picked by hand survives, a lost one is guessed.
-            tag=$(gh api "repos/$REPO/releases/$draft" --jq .tag_name)
             # Keep what was written above the marker; a draft without one is
             # all hand-written, so keep it whole.
             top=$(printf '%s\n' "$old" | tr -d '\r' | awk -v m="$marker" '$0 == m { exit } { print }')
@@ -76,19 +75,27 @@ jobs:
             top=''
           fi
 
-          if [[ "$last" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            next="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
-          else
-            next=v0.1.0
+          # The version of [package] or [workspace.package], whichever the
+          # file has.
+          version=$(awk '/^\[(workspace\.)?package\]/ { p = 1; next } /^\[/ { p = 0 }
+            p && /^version *=/ { gsub(/^[^"]*"|".*$/, ""); print; exit }' "$VERSION_FROM")
+          [ -n "$version" ] || { echo "no version in $VERSION_FROM" >&2; exit 1; }
+          next=v$version
+          # Released already: the PR that makes the next release has not
+          # bumped it yet. Say so at the top rather than guess a number.
+          if gh api "repos/$REPO/releases/tags/$next" >/dev/null 2>&1; then
+            heading="**$next is already released: bump the version in $VERSION_FROM before publishing.**
+
+$heading"
           fi
 
           body=$(printf '%s\n%s\n\n%s\n\n%s\n' "$top" "$marker" "$heading" "$commits")
 
           if [ -n "$draft" ]; then
-            case "$tag" in untagged-*|'') tag=$next ;; esac
+            # A PATCH without tag_name leaves a draft untagged, so always send it.
             gh api -X PATCH "repos/$REPO/releases/$draft" \
-              -f tag_name="$tag" -f target_commitish="$BRANCH" -f body="$body" >/dev/null
-            echo "updated draft $draft ($tag)"
+              -f tag_name="$next" -f name="$next" -f target_commitish="$BRANCH" -f body="$body" >/dev/null
+            echo "updated draft $draft ($next)"
           else
             gh api -X POST "repos/$REPO/releases" \
               -f tag_name="$next" -f target_commitish="$BRANCH" -f name="$next" \
