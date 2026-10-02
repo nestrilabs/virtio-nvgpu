@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use device::caps::Caps;
 use device::host;
 use device::nvidia::NvidiaBackend;
 use device::shm::WindowPlacer;
@@ -60,31 +61,10 @@ struct Args {
     #[arg(long, default_value = host::PROC_NVIDIA)]
     proc_nvidia: PathBuf,
 
-    /// Forward ioctls the ABI profile does not describe instead of refusing
-    /// them, and report what was forwarded at teardown.
-    ///
-    /// For finding out what a workload needs that the tables lack. It hands a
-    /// guest the parts of the host driver's interface nobody has checked, so it
-    /// is not a way to run one.
-    #[arg(long)]
-    permissive_abi: bool,
-
-    /// Serve a guest although the backend runs as root or with CAP_SYS_ADMIN.
-    ///
-    /// The host driver takes a guest's privilege from the backend's, so every
-    /// guest process is then an RM administrator. For a test rig that cannot
-    /// do otherwise; never for a guest you do not trust.
-    #[arg(long)]
-    allow_root_unsafe: bool,
-
-    /// Serve `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools`, which CUDA needs.
-    ///
-    /// Off by default. UVM's calls are forwarded without a table of their
-    /// sizes, and six of them carry a descriptor number that is not
-    /// translated, so the host reads it in the backend's own descriptor
-    /// table. Compute is served properly from v0.2.
-    #[arg(long)]
-    allow_uvm_unsafe: bool,
+    /// What the guest is served: a comma list of graphics, compute, video and
+    /// utility. Compute (CUDA, through nvidia-uvm) is off unless named.
+    #[arg(long, default_value_t = Caps::DEFAULT, value_parser = Caps::parse)]
+    caps: Caps,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -331,11 +311,7 @@ impl NvGpuBackend {
     /// The guest driver rejects `num_gpus == 0`, so a host with no NVIDIA
     /// module loaded is refused here, where the reason can be stated, rather
     /// than in a guest as a bare -EINVAL from probe.
-    fn new(
-        proc_nvidia: &Path,
-        abi_policy: device::nvidia::AbiPolicy,
-        allow_uvm: bool,
-    ) -> anyhow::Result<Self> {
+    fn new(proc_nvidia: &Path, caps: Caps) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
                 "no NVIDIA driver version at {} -- is the kernel module loaded?",
@@ -355,8 +331,7 @@ impl NvGpuBackend {
         nvidia
             .set_host_driver_version(release)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
-        nvidia.set_abi_policy(abi_policy);
-        nvidia.set_allow_uvm(allow_uvm);
+        nvidia.set_caps(caps);
 
         Ok(Self {
             nvidia: Arc::new(Mutex::new(nvidia)),
@@ -365,7 +340,7 @@ impl NvGpuBackend {
             // Phase A forwards ioctls only. nvidia-smi needs no mapping at all
             // -- 100 ioctls and one mmap in the captured trace -- so a guest
             // can enumerate the GPU before the shared window exists.
-            config: VirtioGpuNvConfig::new(&version, &gpus),
+            config: VirtioGpuNvConfig::new(&version, &gpus, caps),
             watches: None,
         })
     }
@@ -588,22 +563,17 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     // Before any device is opened: the host driver judges every guest call by
     // this process's credentials (device::posture).
-    device::posture::enforce(args.allow_root_unsafe)?;
+    device::posture::enforce()?;
 
     log::info!(
-        "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}",
-        args.socket
+        "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}",
+        args.socket,
+        args.caps
     );
 
-    let abi_policy = if args.permissive_abi {
-        device::nvidia::AbiPolicy::Permissive
-    } else {
-        device::nvidia::AbiPolicy::Enforce
-    };
     let backend = Arc::new(RwLock::new(NvGpuBackend::new(
         &args.proc_nvidia,
-        abi_policy,
-        args.allow_uvm_unsafe,
+        args.caps,
     )?));
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.

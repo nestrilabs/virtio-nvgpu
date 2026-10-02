@@ -154,7 +154,9 @@ pub struct VirtioGpuNvConfig {
     pub driver_version: [u8; DRIVER_VERSION_LEN],
     /// How many entries of `gpus` are valid. The driver requires 1..=248.
     pub num_gpus: u32,
-    /// Capability bits.
+    /// What the guest is served, as `crate::caps` bits. Never zero from this
+    /// backend: zero is what a backend from before capabilities sends, and a
+    /// guest driver treats it as "everything, as before".
     pub caps: u32,
     /// PCI device id per GPU.
     pub gpu_device_ids: [u32; MAX_GPUS],
@@ -185,8 +187,9 @@ impl VirtioGpuNvConfig {
     /// More than [`MAX_GPUS`] are truncated: the driver reads no further, so
     /// advertising a count it cannot index would point it at slots that were
     /// never written.
-    pub fn new(driver_version: &str, gpus: &[GpuSlot]) -> Self {
+    pub fn new(driver_version: &str, gpus: &[GpuSlot], caps: crate::caps::Caps) -> Self {
         let mut cfg = Self::default();
+        cfg.caps = caps.bits();
         let v = driver_version.as_bytes();
         let n = v.len().min(DRIVER_VERSION_LEN - 1);
         cfg.driver_version[..n].copy_from_slice(&v[..n]);
@@ -298,10 +301,15 @@ mod tests {
     #[test]
     fn one_gpu_is_described_where_the_driver_looks() {
         let slot = GpuSlot::new("0000:01:00.0", 0, "Model: NVIDIA RTX A2000");
-        let cfg = VirtioGpuNvConfig::new("615.71.09", &[slot]);
+        let cfg = VirtioGpuNvConfig::new("615.71.09", &[slot], crate::caps::Caps::DEFAULT);
         let bytes = cfg.as_bytes();
 
         assert_eq!(&bytes[0..9], b"615.71.09");
+        assert_eq!(
+            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            crate::caps::Caps::DEFAULT.bits(),
+            "caps at offset 36"
+        );
         assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 1);
         assert_eq!(&bytes[72..84], b"0000:01:00.0");
         // info_len, at slot offset 20 within the slot array at 72.
@@ -327,7 +335,7 @@ mod tests {
         let many: Vec<_> = (0..12)
             .map(|i| GpuSlot::new(&format!("0000:0{i}:00.0"), i, ""))
             .collect();
-        let cfg = VirtioGpuNvConfig::new("615.71.09", &many);
+        let cfg = VirtioGpuNvConfig::new("615.71.09", &many, crate::caps::Caps::DEFAULT);
         let n = cfg.num_gpus;
         assert_eq!(
             n as usize, MAX_GPUS,

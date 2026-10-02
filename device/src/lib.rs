@@ -6,6 +6,7 @@
 // real host file descriptors for `/dev/nvidia*` and dispatches messages
 // received from the guest driver over virtqueues.
 
+pub mod caps;
 pub mod error;
 pub mod guarded;
 pub mod handle_table;

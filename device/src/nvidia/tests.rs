@@ -60,7 +60,6 @@ mod abi_tests {
 
         // 0x7f is not an NVIDIA escape and is in no profile.
         assert_eq!(b.check_abi(0x7f, 16), AbiCheck::UnknownEscape);
-        assert_eq!(b.abi_policy, AbiPolicy::Enforce, "enforcing is the default");
 
         // And a size the host does not agree with, on an escape that exists.
         assert!(matches!(
@@ -266,14 +265,64 @@ mod tests {
     }
 
     #[test]
-    fn uvm_is_not_opened_unless_served() {
+    fn uvm_is_not_opened_without_compute() {
         let mut be = NvidiaBackend::for_test();
+        assert!(!be.caps().has(crate::caps::COMPUTE), "compute is opt-in");
         for kind in [DeviceKind::Uvm, DeviceKind::UvmTools] {
             let mut resp = vec![0u8; 64];
             be.dispatch(&open_msg(kind), &mut resp);
             assert_eq!(parse_resp(&resp).status, -libc::ENODEV, "{kind:?}");
         }
         assert_eq!(be.handles.len(), 0);
+    }
+
+    /// The tools device pins user buffers and copies through process memory.
+    /// No capability serves it.
+    #[test]
+    fn uvm_tools_is_refused_even_with_compute() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_caps(crate::caps::Caps::parse("compute,graphics,video,utility").unwrap());
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&open_msg(DeviceKind::UvmTools), &mut resp);
+        assert_eq!(parse_resp(&resp).status, -libc::ENODEV);
+        assert_eq!(be.handles.len(), 0);
+    }
+
+    #[test]
+    fn modeset_and_render_nodes_need_graphics() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_caps(crate::caps::Caps::parse("compute").unwrap());
+        for kind in [DeviceKind::Modeset, DeviceKind::Dri(0)] {
+            let mut resp = vec![0u8; 64];
+            be.dispatch(&open_msg(kind), &mut resp);
+            assert_eq!(parse_resp(&resp).status, -libc::ENODEV, "{kind:?}");
+        }
+        assert_eq!(be.handles.len(), 0);
+    }
+
+    /// A class outside the guest's capabilities is answered the way RM answers
+    /// a class the GPU lacks, without calling the host. The handle is
+    /// /dev/null: reaching it would fail the call with ENOTTY, so a pass also
+    /// shows the host was never asked.
+    #[test]
+    fn an_alloc_outside_the_caps_gets_invalid_class_from_us() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_caps(crate::caps::Caps::parse("graphics,compute").unwrap());
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+
+        let mut nvos64 = vec![0u8; 48];
+        nvos64[12..16].copy_from_slice(&0xc7b7u32.to_le_bytes()); // Ampere NVENC
+        let mut resp = vec![0u8; 256];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos64),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl itself succeeds");
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let status = u32::from_le_bytes(resp[body + 40..body + 44].try_into().unwrap());
+        assert_eq!(status, 0x22, "NV_ERR_INVALID_CLASS in NVOS64.status");
     }
 
     #[test]

@@ -182,7 +182,8 @@ mod tests {
             ("gpus/0000:01:00.0/information", "Model: NVIDIA RTX A2000\n"),
         ]);
         let version = driver_version(f.path()).expect("a version");
-        let cfg = VirtioGpuNvConfig::new(&version, &gpu_slots(f.path()));
+        let cfg =
+            VirtioGpuNvConfig::new(&version, &gpu_slots(f.path()), crate::caps::Caps::DEFAULT);
         let n = cfg.num_gpus;
         assert!(
             n >= 1 && n as usize <= MAX_GPUS,

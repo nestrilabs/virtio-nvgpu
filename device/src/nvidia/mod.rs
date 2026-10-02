@@ -245,13 +245,11 @@ pub struct NvidiaBackend {
     msg_counts: std::collections::BTreeMap<&'static str, u64>,
     /// Every live placement, by the id the guest quotes to take it back.
     live_maps: std::collections::HashMap<u32, LiveMap>,
-    /// Whether an ioctl the profile does not describe is refused or forwarded.
-    abi_policy: AbiPolicy,
-    /// Whether `/dev/nvidia-uvm` and `-uvm-tools` may be opened. Off by
-    /// default: UVM's calls are forwarded without a table of their sizes,
-    /// and six of them carry a descriptor number this backend does not
-    /// translate, so the host would read it in this process's own table.
-    allow_uvm: bool,
+    /// What this guest is served. See `crate::caps`.
+    caps: crate::caps::Caps,
+    /// Opens and allocations refused because their capability is off, by
+    /// what was asked for. Reported at teardown.
+    caps_refused: std::collections::BTreeMap<String, u64>,
     /// Every `RM_ALLOC` class and `RM_CONTROL` command a workload asked for,
     /// and how often.
     ///
@@ -293,24 +291,6 @@ struct LiveMap {
     length: u64,
 }
 
-/// What to do with an ioctl the ABI profile does not vouch for.
-///
-/// Refusing is the default, and the reason is the whole point of having tables:
-/// an escape that is not in them is one whose parameter layout we have never
-/// seen, and forwarding it means handing the host driver bytes that nobody has
-/// checked. `nvproxy`, whose tables these are derived from, has always refused;
-/// this crate logged and forwarded anyway until it was asked, in public, what
-/// exactly a guest can reach.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum AbiPolicy {
-    /// Refuse anything the profile does not describe.
-    #[default]
-    Enforce,
-    /// Forward it anyway and count it. For finding out what a workload needs
-    /// that the tables lack -- never for running one.
-    Permissive,
-}
-
 /// `NvKmsIoctlCommand::NVKMS_IOCTL_REGISTER_SURFACE`, the one that names the
 /// memory it registers by a file descriptor.
 const NVKMS_REGISTER_SURFACE: u32 = 16;
@@ -339,8 +319,8 @@ impl NvidiaBackend {
             dri_maps: std::collections::HashMap::new(),
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
-            abi_policy: AbiPolicy::default(),
-            allow_uvm: false,
+            caps: crate::caps::Caps::DEFAULT,
+            caps_refused: std::collections::BTreeMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: std::collections::BTreeMap::new(),
             rm_controls: std::collections::BTreeMap::new(),
@@ -375,22 +355,25 @@ impl NvidiaBackend {
         self.shm.memfd_raw()
     }
 
-    /// Give the backend somewhere to place device memory.
-    ///
-    /// Until this is called every `RM_MAP_MEMORY` still succeeds on the host --
-    /// the mapping is real -- but the `mmap` that follows is refused, because
-    /// there is no address in the guest that names it.
-    /// Forward ioctls the ABI profile does not describe, instead of refusing
-    /// them. Diagnostic only: it exists to find out what a workload needs.
-    /// Serve opens of the UVM devices (`--allow-uvm-unsafe`).
-    pub fn set_allow_uvm(&mut self, on: bool) {
-        if on {
+    /// Choose what this guest is served.
+    pub fn set_caps(&mut self, caps: crate::caps::Caps) {
+        self.caps = caps;
+    }
+
+    pub fn caps(&self) -> crate::caps::Caps {
+        self.caps
+    }
+
+    /// Count a refusal for want of a capability, and say which one once.
+    fn refuse_for_caps(&mut self, what: String, needs: &str) {
+        let n = self.caps_refused.entry(what.clone()).or_insert(0);
+        if *n == 0 {
             log::warn!(
-                "UVM served: its calls go to the host without a size table, and the \
-                 descriptor numbers six of them carry are not translated"
+                "{what} refused: needs --caps {needs} (serving {})",
+                self.caps
             );
         }
-        self.allow_uvm = on;
+        *n += 1;
     }
 
     /// The host driver's release, from the host itself: the ABI profile is
@@ -409,16 +392,6 @@ impl NvidiaBackend {
         Ok(())
     }
 
-    pub fn set_abi_policy(&mut self, policy: AbiPolicy) {
-        if policy == AbiPolicy::Permissive {
-            log::warn!(
-                "ABI enforcement off: ioctls this build cannot describe will be \
-                 forwarded to the host driver unchecked"
-            );
-        }
-        self.abi_policy = policy;
-    }
-
     /// Descriptors opened and closed since this was last called.
     ///
     /// A transport calls it after serving messages and keeps its poll set in
@@ -431,6 +404,11 @@ impl NvidiaBackend {
         )
     }
 
+    /// Give the backend somewhere to place device memory.
+    ///
+    /// Until this is called every `RM_MAP_MEMORY` still succeeds on the host --
+    /// the mapping is real -- but the `mmap` that follows is refused, because
+    /// there is no address in the guest that names it.
     pub fn set_window(&mut self, placer: Box<dyn crate::shm::WindowPlacer>) {
         self.window = Some(placer);
     }
@@ -484,14 +462,19 @@ impl NvidiaBackend {
             self.handles.len(),
             self.active_maps.len()
         );
-        if !self.abi_refused.is_empty() {
-            let verb = if self.abi_policy == AbiPolicy::Enforce {
-                "refused"
-            } else {
-                "forwarded unchecked"
-            };
+        if !self.caps_refused.is_empty() {
             log::warn!(
-                "NvidiaBackend::teardown: {verb} {} ioctl(s) the ABI profile does not describe: {}",
+                "NvidiaBackend::teardown: refused for want of a capability: {}",
+                self.caps_refused
+                    .iter()
+                    .map(|(w, n)| format!("{w}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        if !self.abi_refused.is_empty() {
+            log::warn!(
+                "NvidiaBackend::teardown: refused {} ioctl(s) the ABI profile does not describe: {}",
                 self.abi_refused.values().sum::<u64>(),
                 self.abi_refused
                     .iter()

@@ -35,6 +35,36 @@ impl NvidiaBackend {
         }
     }
 
+    /// Refuse an RM_ALLOC whose class needs a capability this guest lacks.
+    ///
+    /// The ioctl succeeds and RM's own status word says INVALID_CLASS, which is
+    /// what RM answers for a class the GPU does not have. Drivers probe for
+    /// engines that way and fall back; an errno instead reads as a broken
+    /// device. The host driver is not called.
+    pub(super) fn refuse_alloc_class(
+        &mut self,
+        cookie: u64,
+        class: u32,
+        bit: u32,
+        param_in: &[u8],
+        resp_buf: &mut [u8],
+    ) -> usize {
+        const NVOS64_STATUS: usize = 40;
+        const NV_ERR_INVALID_CLASS: u32 = 0x22;
+        let needs = if bit == crate::caps::VIDEO {
+            "video"
+        } else {
+            "graphics"
+        };
+        self.refuse_for_caps(format!("RM_ALLOC class {class:#06x}"), needs);
+        let mut out = param_in.to_vec();
+        if out.len() < NVOS64_STATUS + 4 {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        }
+        out[NVOS64_STATUS..NVOS64_STATUS + 4].copy_from_slice(&NV_ERR_INVALID_CLASS.to_le_bytes());
+        self.write_ioctl_resp(resp_buf, cookie, &out)
+    }
+
     /// Check one guest ioctl against the host's ABI profile.
     ///
     /// A size mismatch is the failure this is for: the guest and host disagree
@@ -151,14 +181,7 @@ impl NvidiaBackend {
 
             if refuse {
                 *self.abi_refused.entry(escape).or_insert(0) += 1;
-                if self.abi_policy == AbiPolicy::Enforce {
-                    return self.write_error_resp(
-                        resp_buf,
-                        Status::IoctlFailed,
-                        cookie,
-                        libc::EINVAL,
-                    );
-                }
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
             }
         }
 
@@ -324,6 +347,11 @@ impl NvidiaBackend {
                 if param_in.len() >= 16 {
                     let class = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
                     *self.rm_classes.entry(class).or_insert(0) += 1;
+                    if let Some(bit) = crate::caps::Caps::for_class(class) {
+                        if !self.caps.has(bit) {
+                            return self.refuse_alloc_class(cookie, class, bit, param_in, resp_buf);
+                        }
+                    }
                 }
                 self.dispatch_nested(
                     cookie, host_fd, request, param_in, resp_buf, 48, 16, 32, deep_in, None,

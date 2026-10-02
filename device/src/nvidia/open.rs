@@ -18,13 +18,24 @@ impl NvidiaBackend {
         }
         let req = read_struct::<OpenReq>(payload, 0);
 
-        if !self.allow_uvm
-            && matches!(
-                DeviceKind::from_device_type(req.device_type),
-                Some(DeviceKind::Uvm | DeviceKind::UvmTools)
-            )
-        {
-            log::warn!("open of a UVM device refused: UVM is not served (--allow-uvm-unsafe)");
+        // ENODEV, before any host open: the same answer a host without the
+        // device gives, which every client already handles.
+        use crate::caps::{COMPUTE, GRAPHICS};
+        let refusal = match DeviceKind::from_device_type(req.device_type) {
+            Some(DeviceKind::UvmTools) => Some(("open nvidia-uvm-tools", "(none: never served)")),
+            Some(DeviceKind::Uvm) if !self.caps.has(COMPUTE) => {
+                Some(("open nvidia-uvm", "compute"))
+            }
+            Some(DeviceKind::Modeset) if !self.caps.has(GRAPHICS) => {
+                Some(("open nvidia-modeset", "graphics"))
+            }
+            Some(DeviceKind::Dri(_)) if !self.caps.has(GRAPHICS) => {
+                Some(("open render node", "graphics"))
+            }
+            _ => None,
+        };
+        if let Some((what, needs)) = refusal {
+            self.refuse_for_caps(what.to_string(), needs);
             return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::ENODEV);
         }
 

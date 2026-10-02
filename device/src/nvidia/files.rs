@@ -214,7 +214,13 @@ impl NvidiaBackend {
     /// driver it could load and then declined to create an instance, with no
     /// ioctl refused and nothing logged anywhere.
     pub(super) fn write_dri_section(&self, buf: &mut [u8]) -> usize {
-        let devices = self.dri_devices();
+        // Without graphics there is no render node to offer, and a guest told
+        // of none creates none, whatever it knows about capabilities.
+        let devices = if self.caps.has(crate::caps::GRAPHICS) {
+            self.dri_devices()
+        } else {
+            Vec::new()
+        };
         log::info!("GET_SYS_FILES: {} DRI device(s)", devices.len());
 
         if buf.len() < 4 {
