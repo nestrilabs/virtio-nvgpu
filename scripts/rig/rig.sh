@@ -231,12 +231,36 @@ do_stage() {
 }
 
 do_probe() {
+    # Each guest runs detached on the GPU host and writes its own summary, and
+    # this side polls for it. A dropped connection then costs a retry of the
+    # poll, not the run: an ssh that dies mid-boot used to take the probe's
+    # output with it, and retrying meant booting the guest again.
     [ $# -gt 0 ] || { log "probe: name at least one probe"; exit 2; }
-    local p rc=0
+    local p rc=0 tag sum out i
     for p in "$@"; do
+        tag="$TAG-${p%.sh}${TAG_SUFFIX:-}"
+        sum="${GPU_LOGS:?}/$tag.summary"
         log "probe $p on $GPU_HOST"
-        remote "$GPU_HOST" "$(gpu_env) BACKEND_ARGS=$(printf %q "${BACKEND_ARGS:-}") GUEST_ARGS=$(printf %q "${GUEST_ARGS:-}") BACKEND_WRAP=$(printf %q "${BACKEND_WRAP:-}") \
-            bash $GPU_DIR/scripts/rig/box-run.sh $p $TAG-${p%.sh}${TAG_SUFFIX:-}" || rc=$?
+        remote "$GPU_HOST" "
+            mkdir -p '$GPU_LOGS'; rm -f '$sum'
+            $(gpu_env) BACKEND_ARGS=$(printf %q "${BACKEND_ARGS:-}") GUEST_ARGS=$(printf %q "${GUEST_ARGS:-}") \
+            BACKEND_WRAP=$(printf %q "${BACKEND_WRAP:-}") \
+                setsid nohup bash -c 'bash $GPU_DIR/scripts/rig/box-run.sh $p $tag; echo \"rig-done rc=\$?\"' \
+                > '$sum' 2>&1 < /dev/null &
+        " || { rc=$?; continue; }
+        out=""
+        for i in $(seq 1 360); do
+            sleep 5
+            out=$(remote "$GPU_HOST" "grep -q '^rig-done' '$sum' 2>/dev/null && cat '$sum'" 2>/dev/null) && break
+            out=""
+        done
+        if [ -z "$out" ]; then
+            log "probe $p: no result after 30 minutes; see $GPU_HOST:$sum"
+            rc=1
+            continue
+        fi
+        printf '%s\n' "$out" | grep -v '^rig-done'
+        printf '%s\n' "$out" | grep -q '^rig-done rc=0' || rc=1
     done
     return $rc
 }
