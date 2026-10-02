@@ -21,6 +21,8 @@
 #                    root it runs as the login user.
 #   BACKEND_ARGS     extra backend arguments, e.g. "--caps graphics,compute"
 #   GUEST_ARGS       appended to the guest kernel command line
+#   BACKEND_WRAP     a command the backend runs under, e.g.
+#                    "strace -f -c -o /tmp/backend.strace"
 #   GPU_TIMEOUT      seconds before the guest is killed (default 180)
 #
 # Prints the guest's result lines and the backend's refusals, and leaves
@@ -67,7 +69,7 @@ cat > "$GPU_LOGS/$RUN_TAG.json" <<JSON
 JSON
 
 # shellcheck disable=SC2086
-RUST_LOG=${RUST_LOG:-info} "${AS[@]}" "$BACKEND" --socket "$SOCK" ${BACKEND_ARGS:-} \
+RUST_LOG=${RUST_LOG:-info} "${AS[@]}" ${BACKEND_WRAP:-} "$BACKEND" --socket "$SOCK" ${BACKEND_ARGS:-} \
     > "$GPU_LOGS/$RUN_TAG.backend.log" 2>&1 &
 BE=$!
 trap 'kill $BE 2>/dev/null || true; rm -rf "$RUN"' EXIT

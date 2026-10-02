@@ -235,7 +235,7 @@ do_probe() {
     local p rc=0
     for p in "$@"; do
         log "probe $p on $GPU_HOST"
-        remote "$GPU_HOST" "$(gpu_env) BACKEND_ARGS=$(printf %q "${BACKEND_ARGS:-}") GUEST_ARGS=$(printf %q "${GUEST_ARGS:-}") \
+        remote "$GPU_HOST" "$(gpu_env) BACKEND_ARGS=$(printf %q "${BACKEND_ARGS:-}") GUEST_ARGS=$(printf %q "${GUEST_ARGS:-}") BACKEND_WRAP=$(printf %q "${BACKEND_WRAP:-}") \
             bash $GPU_DIR/scripts/rig/box-run.sh $p $TAG-${p%.sh}${TAG_SUFFIX:-}" || rc=$?
     done
     return $rc
