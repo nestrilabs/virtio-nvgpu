@@ -35,7 +35,8 @@ jobs:
           set -euo pipefail
           marker='<!-- everything below is rewritten on every push; write above this line -->'
 
-          last=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+          # No release yet is a 404, and gh prints the error body to stdout.
+          last=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null) || last=
           if [ -n "$last" ]; then range="$last..HEAD"; else range=HEAD; fi
           commits=$(git log --reverse --no-merges --format='- %s (%an)' "$range")
           [ -n "$commits" ] || commits='- (no commits since the last release)'
