@@ -1,0 +1,75 @@
+# Keeps one draft release up to date with every commit since the last
+# published release: "- <commit title> (<author>)", oldest first.
+#
+# To release: open the draft, change the tag if the guessed one is wrong,
+# write anything extra ABOVE the marker line, publish. Text above the marker
+# survives every rewrite; everything below it is regenerated on each push.
+name: Draft release
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: draft-release
+  cancel-in-progress: true
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Write the commit list into the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          marker='<!-- everything below is rewritten on every push; write above this line -->'
+
+          last=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+          if [ -n "$last" ]; then range="$last..HEAD"; else range=HEAD; fi
+          commits=$(git log --reverse --no-merges --format='- %s (%an)' "$range")
+          [ -n "$commits" ] || commits='- (no commits since the last release)'
+          if [ -n "$last" ]; then
+            since="Since $last:"
+          else
+            since="All commits (no release yet):"
+          fi
+
+          draft=$(gh api "repos/$REPO/releases" --paginate \
+            --jq '[.[] | select(.draft)] | first | if . then "\(.id)" else empty end' | sed -n 1p)
+
+          if [ -n "$draft" ]; then
+            old=$(gh api "repos/$REPO/releases/$draft" --jq '.body // ""')
+            # Keep what was written above the marker; a draft without one is
+            # all hand-written, so keep it whole.
+            top=$(printf '%s\n' "$old" | tr -d '\r' | awk -v m="$marker" '$0 == m { exit } { print }')
+          else
+            top=''
+          fi
+
+          body=$(printf '%s\n%s\n\n%s\n\n%s\n' "$top" "$marker" "$since" "$commits")
+
+          if [ -n "$draft" ]; then
+            gh api -X PATCH "repos/$REPO/releases/$draft" -f body="$body" >/dev/null
+            echo "updated draft $draft"
+          else
+            if [[ "$last" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              next="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+            else
+              next=v0.1.0
+            fi
+            gh api -X POST "repos/$REPO/releases" \
+              -f tag_name="$next" -f target_commitish="$BRANCH" -f name="$next" \
+              -F draft=true -f body="$body" >/dev/null
+            echo "created draft $next"
+          fi
