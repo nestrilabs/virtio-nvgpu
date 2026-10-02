@@ -18,6 +18,8 @@
 #   rig.sh caps [SET...]     boot rig-probe-caps.sh once per capability set
 #                            (default: the four sets below), each checked
 #                            against the nodes the guest should have
+#   rig.sh hostbench         rmbench on the GPU host itself, as the backend's
+#                            user, for the bare-metal side of the ratio
 #   rig.sh all P [P...]      sync, build, module, stage, probe
 #
 # RIG_TARGET picks scripts/rig/hosts-$RIG_TARGET.env (default box1). Those
@@ -249,6 +251,18 @@ do_caps() {
     return $rc
 }
 
+do_hostbench() {
+    remote "$GPU_HOST" "
+        set -euo pipefail
+        b=$GPU_DIR/scripts/rig/guest/rmbench
+        [ -x \$b ] || cc -O2 -static -o \$b \$b.c
+        cp \$b /tmp/rmbench-host && chmod 755 /tmp/rmbench-host
+        as=()
+        [ ${GPU_ROOT:-1} = 1 ] && as=(setpriv --reuid=${GPU_USER:-nvgpu-test} --regid=${GPU_USER:-nvgpu-test} --init-groups)
+        for i in 1 2 3; do \"\${as[@]}\" /tmp/rmbench-host 100000; done
+    "
+}
+
 cmd=${1:-}
 shift || true
 case "$cmd" in
@@ -261,6 +275,7 @@ module) do_module ;;
 stage) do_stage ;;
 probe) do_probe "$@" ;;
 caps) do_caps "$@" ;;
+hostbench) do_hostbench ;;
 all) do_sync; do_build; do_module; do_stage; do_probe "$@" ;;
 *) sed -n '2,12p' "$0" >&2; exit 2 ;;
 esac

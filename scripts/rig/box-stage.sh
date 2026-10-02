@@ -22,8 +22,15 @@ if pgrep -f "nesbox.*$TAG-" >/dev/null; then
     exit 4
 fi
 
+# C probes are built here, static, so the guest needs no libraries for them.
+for c in "$GPU_DIR"/scripts/rig/guest/*.c; do
+    [ -f "$c" ] || continue
+    cc -O2 -static -o "${c%.c}" "$c" || { echo "box-stage: $c did not build" >&2; exit 5; }
+done
 files=("$GPU_DIR/driver/virtio_gpu_nv.ko")
-for f in "$GPU_DIR"/scripts/rig/guest/*; do [ -f "$f" ] && files+=("$f"); done
+for f in "$GPU_DIR"/scripts/rig/guest/*; do
+    [ -f "$f" ] && [ "${f%.c}" = "$f" ] && files+=("$f")
+done
 [ -f "${files[0]}" ] || { echo "box-stage: no module at ${files[0]}" >&2; exit 3; }
 stamp=$(cat "$GPU_DIR/scripts/rig/.stamp" 2>/dev/null || echo unknown)
 
