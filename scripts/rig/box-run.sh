@@ -20,6 +20,7 @@
 #                    render node, because it refuses to run as root. Without
 #                    root it runs as the login user.
 #   BACKEND_ARGS     extra backend arguments, e.g. "--caps graphics,compute"
+#   GUEST_ARGS       appended to the guest kernel command line
 #   GPU_TIMEOUT      seconds before the guest is killed (default 180)
 #
 # Prints the guest's result lines and the backend's refusals, and leaves
@@ -52,7 +53,7 @@ cat > "$GPU_LOGS/$RUN_TAG.json" <<JSON
 {
   "boot-source": {
     "kernel_image_path": "$GPU_KERNEL",
-    "boot_args": "console=hvc0 root=/dev/vda rw init=/opt/nvgpu/$PROBE"
+    "boot_args": "console=hvc0 root=/dev/vda rw init=/opt/nvgpu/$PROBE ${GUEST_ARGS:-}"
   },
   "drives": [
     { "drive_id": "rootfs", "path_on_host": "$GPU_ROOTFS", "is_root_device": true, "is_read_only": false }
@@ -86,7 +87,7 @@ kill $BE 2>/dev/null || true
 wait $BE 2>/dev/null || true
 
 echo "== $PROBE ($RUN_TAG) on $(uname -n), stamp $(cat "$(dirname "$0")/.stamp" 2>/dev/null || echo ?)"
-grep -aE 'PASS|FAIL|frames=|deviceName|offscreen-draw|cuda|CUDA|panic|Oops' \
+grep -aE 'PASS|FAIL|frames=|deviceName|offscreen-draw|nvidia-smi:|cuda|CUDA|panic|Oops' \
     "$GPU_LOGS/$RUN_TAG.console.log" | sed 's/^/  /' | head -n 30 || true
 grep -aE 'refus|served [0-9]+ message|panicked|error' "$GPU_LOGS/$RUN_TAG.backend.log" |
     sed -E 's/^\[[^]]*\] ?//; s/^/  backend: /' | head -n 20 || true

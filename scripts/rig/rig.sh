@@ -15,6 +15,9 @@
 #   rig.sh nesbox            test and build the VMM at NESBOX_SRC on the build
 #                            host (static, forwarding only, no renderer) and
 #                            copy it to the GPU host as nesbox-$TAG
+#   rig.sh caps [SET...]     boot rig-probe-caps.sh once per capability set
+#                            (default: the four sets below), each checked
+#                            against the nodes the guest should have
 #   rig.sh all P [P...]      sync, build, module, stage, probe
 #
 # RIG_TARGET picks scripts/rig/hosts-$RIG_TARGET.env (default box1). Those
@@ -85,7 +88,7 @@ push() {
     local i
     for i in $(seq 1 "$RIG_TRIES"); do
         rsync -az --delete \
-            --exclude target/ --exclude .git/ --exclude /out/ --exclude /out-test.log \
+            --exclude target/ --exclude .git/ --exclude /out/ --exclude "/out-*.log" \
             --exclude PLAN.md --exclude NOTES.md --exclude notes/ \
             --exclude 'scripts/rig/hosts-*.env' \
             --exclude '*.ko' --exclude '*.o' --exclude '*.mod*' --exclude '.*.cmd' \
@@ -230,8 +233,18 @@ do_probe() {
     local p rc=0
     for p in "$@"; do
         log "probe $p on $GPU_HOST"
-        remote "$GPU_HOST" "$(gpu_env) BACKEND_ARGS=$(printf %q "${BACKEND_ARGS:-}") \
-            bash $GPU_DIR/scripts/rig/box-run.sh $p $TAG-${p%.sh}" || rc=$?
+        remote "$GPU_HOST" "$(gpu_env) BACKEND_ARGS=$(printf %q "${BACKEND_ARGS:-}") GUEST_ARGS=$(printf %q "${GUEST_ARGS:-}") \
+            bash $GPU_DIR/scripts/rig/box-run.sh $p $TAG-${p%.sh}${TAG_SUFFIX:-}" || rc=$?
+    done
+    return $rc
+}
+
+do_caps() {
+    local sets=("$@") set rc=0
+    [ ${#sets[@]} -gt 0 ] || sets=(graphics,video,utility graphics,compute,video,utility compute video)
+    for set in "${sets[@]}"; do
+        BACKEND_ARGS="--caps $set" GUEST_ARGS="nvgpu_expect=$set" TAG_SUFFIX="-$set" \
+            do_probe rig-probe-caps.sh || rc=$?
     done
     return $rc
 }
@@ -247,6 +260,7 @@ build) do_build ;;
 module) do_module ;;
 stage) do_stage ;;
 probe) do_probe "$@" ;;
+caps) do_caps "$@" ;;
 all) do_sync; do_build; do_module; do_stage; do_probe "$@" ;;
 *) sed -n '2,12p' "$0" >&2; exit 2 ;;
 esac
