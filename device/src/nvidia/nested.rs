@@ -48,7 +48,7 @@ impl NvidiaBackend {
         // Log RM_CONTROL/RM_ALLOC for debugging Vulkan init
         if escape == 0x2A && outer.len() >= 12 {
             let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-            log::info!(
+            log::debug!(
                 "RM_CONTROL cmd=0x{:x} (hClient={}, hObject={})",
                 cmd,
                 u32::from_le_bytes(outer[0..4].try_into().unwrap()),
@@ -57,7 +57,7 @@ impl NvidiaBackend {
         }
         if escape == 0x2B && outer.len() >= 16 {
             let h_class = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-            log::info!("RM_ALLOC hClass=0x{:x}", h_class);
+            log::debug!("RM_ALLOC hClass=0x{:x}", h_class);
         }
 
         if !nested_in.is_empty() {
@@ -67,7 +67,7 @@ impl NvidiaBackend {
             // here, and if it writes more than the caller's size field claimed,
             // the fault should land on that write rather than on someone else's
             // allocation later.
-            let mut host_guard = match crate::guarded::GuardedBuf::new(nested_size) {
+            let mut host_guard = match crate::guarded::GuardPool::lease(&self.guards, nested_size) {
                 Some(b) => b,
                 None => {
                     return self.write_error_resp(
@@ -297,20 +297,23 @@ impl NvidiaBackend {
                 let status =
                     u32::from_le_bytes(outer[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap());
                 if status == NV_OK {
-                    log::info!(
+                    log::debug!(
                         "RM_CONTROL cmd=0x{:08x} paramsSize={} -> NV_OK",
                         cmd,
                         params_size
                     );
-                } else {
+                } else if log::log_enabled!(log::Level::Debug) {
                     // A refusal tells us nothing on its own; the argument RM
                     // objected to is in the params. Show the head of them.
+                    // Debug, not warn: drivers probe for features by asking
+                    // and being refused, so this is the normal path, and it
+                    // ran on every such call.
                     let head: Vec<String> = host_buf
                         .iter()
                         .take(64)
                         .map(|b| format!("{b:02x}"))
                         .collect();
-                    log::warn!(
+                    log::debug!(
                         "RM_CONTROL cmd=0x{:08x} paramsSize={} -> status=0x{:08x}\n  params[0..64]: {}",
                         cmd,
                         params_size,
@@ -322,7 +325,7 @@ impl NvidiaBackend {
             if escape == 0x2b && param_in.len() >= 48 {
                 let hclass = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
                 let params_size = u32::from_le_bytes(param_in[32..36].try_into().unwrap());
-                log::info!(
+                log::debug!(
                     "RM_ALLOC ENTER: hClass=0x{:04x} paramsSize={} (nested_bytes={})",
                     hclass,
                     params_size,
@@ -365,11 +368,11 @@ impl NvidiaBackend {
             if escape == 0x2a {
                 let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-                log::info!("(else) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
+                log::debug!("(else) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
             } else if escape == 0x2b {
                 let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
                 let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-                log::info!(
+                log::debug!(
                     "(else) RM_ALLOC hClass=0x{:04x} status=0x{:x}",
                     hclass,
                     status

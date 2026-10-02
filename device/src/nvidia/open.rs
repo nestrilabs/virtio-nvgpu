@@ -65,7 +65,7 @@ impl NvidiaBackend {
         // becomes readable. Offered to the transport as watchable; duplicated
         // there rather than here, so the watch cannot outlive this table's fd.
         self.watch_added.push((guest_handle as u32, raw_fd));
-        log::info!("open {:?} -> handle={guest_handle} (fd={raw_fd})", path);
+        log::debug!("open {:?} -> handle={guest_handle} (fd={raw_fd})", path);
 
         // The handle is returned in the header. The driver reads it from there
         // and there is no response payload at all.

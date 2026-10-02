@@ -289,7 +289,7 @@ impl NvidiaBackend {
             let asked = u64::from_le_bytes(param_in[0..8].try_into().unwrap());
             let flags = uvm_init_flags(host);
             if asked != flags {
-                log::info!("UVM_INITIALIZE: guest asked flags {asked:#x}, sent {flags:#x}");
+                log::debug!("UVM_INITIALIZE: guest asked flags {asked:#x}, sent {flags:#x}");
             }
             let mut p = param_in.to_vec();
             p[0..8].copy_from_slice(&flags.to_le_bytes());

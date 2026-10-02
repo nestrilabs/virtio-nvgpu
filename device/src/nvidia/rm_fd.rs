@@ -93,7 +93,7 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
-        log::info!(
+        log::debug!(
             "UPDATE_DEVICE_MAPPING_INFO: ENTERED, host_fd={}, param_in.len={}",
             host_fd,
             param_in.len()
@@ -108,7 +108,7 @@ impl NvidiaBackend {
         let old_cpu_addr = u64::from_le_bytes(param_in[16..24].try_into().unwrap());
         let new_cpu_addr = u64::from_le_bytes(param_in[24..32].try_into().unwrap());
 
-        log::info!(
+        log::debug!(
             "UPDATE_DEVICE_MAPPING_INFO: client={:#x} mem={:#x} old={:#x} new={:#x}",
             h_client,
             h_memory,
@@ -122,7 +122,7 @@ impl NvidiaBackend {
         let mut host_old = old_cpu_addr;
         if let Some(entry) = self.active_maps.find_by_object(h_client, h_memory) {
             host_old = entry.host_p_linear_address;
-            log::info!(
+            log::debug!(
                 "UPDATE_DEVICE_MAPPING_INFO: translated old {:#x} → host {:#x}",
                 old_cpu_addr,
                 host_old
@@ -146,7 +146,7 @@ impl NvidiaBackend {
         }
 
         let status = u32::from_le_bytes(param_buf[32..36].try_into().unwrap());
-        log::info!("UPDATE_DEVICE_MAPPING_INFO: host status=0x{:x}", status);
+        log::debug!("UPDATE_DEVICE_MAPPING_INFO: host status=0x{:x}", status);
 
         // Zero out the addresses before sending back to guest
         param_buf[16..24].copy_from_slice(&0u64.to_le_bytes());
@@ -309,7 +309,7 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
 
-        log::info!(
+        log::debug!(
             "dispatch_map_memory: returning shm_offset=0x{:x} shm_length=0x{:x} pgprot={}",
             region.offset,
             length,
@@ -334,7 +334,7 @@ impl NvidiaBackend {
         // The handle is the key the mmap that follows will be found by, so it
         // is the one field worth naming in the log: a mapping that is armed
         // against one file and consumed on another is the whole failure mode.
-        log::info!(
+        log::debug!(
             "MAP_MEMORY: armed on handle {} (shm_off={:#x}) → host_va={:#x} client={:#x} mem={:#x}",
             guest_fd_handle,
             region.offset,
@@ -418,7 +418,7 @@ impl NvidiaBackend {
             }
         };
 
-        log::info!(
+        log::debug!(
             "UNMAP_MEMORY: shm_off={:#x} → host_va={:#x} (client={:#x}, mem={:#x})",
             guest_linear,
             entry.host_p_linear_address,
@@ -440,7 +440,7 @@ impl NvidiaBackend {
         }
 
         let status = u32::from_le_bytes(param_buf[24..28].try_into().unwrap());
-        log::info!("UNMAP_MEMORY: host status=0x{:x}", status);
+        log::debug!("UNMAP_MEMORY: host status=0x{:x}", status);
 
         if status == 0 {
             // Host unmap succeeded -- restore the SHM backing and return the

@@ -245,6 +245,8 @@ pub struct NvidiaBackend {
     msg_counts: std::collections::BTreeMap<&'static str, u64>,
     /// Every live placement, by the id the guest quotes to take it back.
     live_maps: std::collections::HashMap<u32, LiveMap>,
+    /// Guarded buffers for parameter blocks, reused across calls.
+    guards: std::cell::RefCell<crate::guarded::GuardPool>,
     /// What this guest is served. See `crate::caps`.
     caps: crate::caps::Caps,
     /// Opens and allocations refused because their capability is off, by
@@ -319,6 +321,7 @@ impl NvidiaBackend {
             dri_maps: std::collections::HashMap::new(),
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
+            guards: Default::default(),
             caps: crate::caps::Caps::DEFAULT,
             caps_refused: std::collections::BTreeMap::new(),
             abi_refused: std::collections::BTreeMap::new(),

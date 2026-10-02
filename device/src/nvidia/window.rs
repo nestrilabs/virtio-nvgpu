@@ -171,7 +171,7 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
         }
 
-        log::info!(
+        log::debug!(
             "mmap on handle {handle}: placed {length:#x} bytes at window offset {:#x} \
              with no arming recorded here",
             region.offset

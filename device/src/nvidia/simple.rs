@@ -59,7 +59,7 @@ impl NvidiaBackend {
 
             // Special handling: NV_ESC_SYS_PARAMS (0xd6) - retry on EBUSY
             if escape == 0xd6 && errno == libc::EBUSY && retry_with_v2 {
-                log::info!("NV_ESC_SYS_PARAMS: got EBUSY, retrying with Cmd=2");
+                log::debug!("NV_ESC_SYS_PARAMS: got EBUSY, retrying with Cmd=2");
                 param_buf[0] = 2; // Try V2
                 let rc2 =
                     unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
@@ -111,13 +111,13 @@ impl NvidiaBackend {
                     0xd2 => {
                         // NV_ESC_CHECK_VERSION_STR - version string at offset 0
                         let version = String::from_utf8_lossy(preview);
-                        log::info!("CHECK_VERSION_STR response: {:?}", version);
+                        log::debug!("CHECK_VERSION_STR response: {:?}", version);
                     }
                     0xc8 => {
-                        log::info!("CARD_INFO response[0..128]: {:02x?}", preview);
+                        log::debug!("CARD_INFO response[0..128]: {:02x?}", preview);
                     }
                     0xd6 => {
-                        log::info!("SYS_PARAMS response[0..128]: {:02x?}", preview);
+                        log::debug!("SYS_PARAMS response[0..128]: {:02x?}", preview);
                     }
                     0x2a => {
                         // RM_CONTROL - log first few bytes of params
@@ -131,7 +131,7 @@ impl NvidiaBackend {
                         } else {
                             0
                         };
-                        log::info!(
+                        log::debug!(
                             "RM_CONTROL response: status={:#x}, data[4..32]={:02x?}",
                             status,
                             &param_buf[4..std::cmp::min(32, param_buf.len())]
@@ -149,7 +149,7 @@ impl NvidiaBackend {
                         } else {
                             0
                         };
-                        log::info!(
+                        log::debug!(
                             "RM_ALLOC response: status={:#x}, data[4..32]={:02x?}",
                             status,
                             &param_buf[4..std::cmp::min(32, param_buf.len())]
@@ -159,7 +159,7 @@ impl NvidiaBackend {
                 }
             }
             if escape == 0x57 || escape == 0x58 {
-                log::info!(
+                log::debug!(
                     "MAP/UNMAP_DMA(0x{:02x}): response[{}]={:02x?}",
                     escape,
                     param_buf.len(),
@@ -172,7 +172,7 @@ impl NvidiaBackend {
             // storm -- which it did, for as long as it took to count the
             // namespaces separately.
             if escape == 0x4a && ((request >> 8) & 0xFF) as u32 == b'F' as u32 {
-                log::info!(
+                log::debug!(
                     "VID_HEAP_CONTROL: response[{}]={:02x?}",
                     param_buf.len(),
                     &param_buf[..std::cmp::min(param_buf.len(), 184)]
