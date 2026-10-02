@@ -293,12 +293,7 @@ impl NvidiaBackend {
         }
     }
 
-    fn serve_ioctl(
-        &mut self,
-        cookie: u64,
-        payload: &[u8],
-        resp_buf: &mut [u8],
-    ) -> usize {
+    fn serve_ioctl(&mut self, cookie: u64, payload: &[u8], resp_buf: &mut [u8]) -> usize {
         if payload.len() < size_of::<IoctlReq>() {
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, cookie, 0);
         }

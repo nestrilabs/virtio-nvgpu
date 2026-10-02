@@ -201,7 +201,7 @@ impl NvidiaBackend {
                 return Err(format!(
                     "it wants {want:?} at byte {} and descriptor {guest} is {other:?}",
                     slot.at
-                ))
+                ));
             }
         }
 
