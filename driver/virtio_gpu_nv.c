@@ -62,11 +62,6 @@ extern struct kset *module_kset;
 
 #define VIRTIO_ID_GPU_NV 45
 
-/* Feature bits */
-#define VIRTIO_GPU_NV_F_UVM 0
-#define VIRTIO_GPU_NV_F_ENCODE 1
-#define VIRTIO_GPU_NV_F_GRAPHICS 2
-
 /* ───────── NVIDIA device node numbers ───────── */
 
 #define NV_MAJOR 195
@@ -93,11 +88,18 @@ extern struct kset *module_kset;
 #define NV_MODESET_MINOR 254
 #define NVGPU_DEV_MODESET 258
 
-/* capability bits */
+/*
+ * What the backend serves, from config `caps` (device/src/caps.rs holds the
+ * same bits). They decide which device nodes exist, so an application sees a
+ * host without a feature instead of one whose open fails. A backend from
+ * before capabilities sends 0; that is read as everything, as it was then.
+ */
 #define NVGPU_CAP_COMPUTE (1 << 0)
 #define NVGPU_CAP_GRAPHICS (1 << 1)
 #define NVGPU_CAP_VIDEO (1 << 2)
 #define NVGPU_CAP_UTILITY (1 << 3)
+#define NVGPU_CAP_ALL                                                          \
+  (NVGPU_CAP_COMPUTE | NVGPU_CAP_GRAPHICS | NVGPU_CAP_VIDEO | NVGPU_CAP_UTILITY)
 
 /* NVIDIA ioctl numbers that require nested-pointer marshalling */
 #define NV_ESC_RM_CONTROL 0x2a
@@ -484,6 +486,12 @@ struct nvgpu_device {
   char driver_version[32];
   u32 num_gpus;
   u32 caps;
+  /* caps was 0: a backend that predates them, served as v0.1 was. */
+  bool legacy_caps;
+  /* Which optional nodes probe registered, so remove() undoes only those. */
+  bool has_uvm;
+  bool has_uvm_tools;
+  bool has_modeset;
 
   /* Serialise virtqueue access */
   struct mutex vq_lock;
@@ -4369,6 +4377,13 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   virtio_cread(vdev, struct virtio_gpu_nv_config, num_gpus, &dev->num_gpus);
   virtio_cread(vdev, struct virtio_gpu_nv_config, caps, &dev->caps);
 
+  if (dev->caps == 0) {
+    dev->legacy_caps = true;
+    dev->caps = NVGPU_CAP_ALL;
+  }
+  dev_info(&vdev->dev, "virtio-gpu-nv: caps %#x%s\n", dev->caps,
+           dev->legacy_caps ? " (backend predates caps; serving all)" : "");
+
   if (dev->num_gpus == 0 || dev->num_gpus > 248) {
     dev_err(&vdev->dev, "virtio-gpu-nv: bad num_gpus %u\n", dev->num_gpus);
     return -EINVAL;
@@ -4453,39 +4468,53 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   device_create(nvgpu_class, &vdev->dev, MKDEV(NV_MAJOR, NV_CTL_MINOR), NULL,
                 "nvidiactl");
 
-  /* Register /dev/nvidia-uvm (major should match host) */
+  /*
+   * /dev/nvidia-uvm (major should match host), only with compute: CUDA then
+   * finds no UVM and reports no device, rather than failing an open. The tools
+   * node is never served by a backend that knows capabilities, so it exists
+   * only for one that does not.
+   */
   dev->uvm_devno = MKDEV(NV_UVM_MAJOR, 0);
-  ret = register_chrdev_region(dev->uvm_devno, 2, "nvidia-uvm");
-  if (ret)
-    goto err_ctl_cdev;
+  if (dev->caps & NVGPU_CAP_COMPUTE) {
+    ret = register_chrdev_region(dev->uvm_devno, 2, "nvidia-uvm");
+    if (ret)
+      goto err_ctl_cdev;
 
-  cdev_init(&dev->cdev_uvm, &nvgpu_uvm_fops);
-  dev->cdev_uvm.owner = THIS_MODULE;
-  ret = cdev_add(&dev->cdev_uvm, dev->uvm_devno, 1);
-  if (ret)
-    goto err_uvm_region;
+    cdev_init(&dev->cdev_uvm, &nvgpu_uvm_fops);
+    dev->cdev_uvm.owner = THIS_MODULE;
+    ret = cdev_add(&dev->cdev_uvm, dev->uvm_devno, 1);
+    if (ret)
+      goto err_uvm_region;
 
-  device_create(nvgpu_class, &vdev->dev, dev->uvm_devno, NULL, "nvidia-uvm");
-  device_create(nvgpu_class, &vdev->dev, MKDEV(NV_UVM_MAJOR, 1), NULL,
-                "nvidia-uvm-tools");
+    device_create(nvgpu_class, &vdev->dev, dev->uvm_devno, NULL, "nvidia-uvm");
+    dev->has_uvm = true;
+    if (dev->legacy_caps) {
+      device_create(nvgpu_class, &vdev->dev, MKDEV(NV_UVM_MAJOR, 1), NULL,
+                    "nvidia-uvm-tools");
+      dev->has_uvm_tools = true;
+    }
+  }
 
-  /* Register /dev/nvidia-modeset (match host, major 195, minor 254) */
+  /* /dev/nvidia-modeset (match host, major 195, minor 254), with graphics. */
   dev->modeset_devno = MKDEV(NV_MAJOR, NV_MODESET_MINOR);
-  ret = register_chrdev_region(dev->modeset_devno, 1, "nvidia-modeset");
-  if (ret)
-    goto err_gpu_modeset;
+  if (dev->caps & NVGPU_CAP_GRAPHICS) {
+    ret = register_chrdev_region(dev->modeset_devno, 1, "nvidia-modeset");
+    if (ret)
+      goto err_uvm_region;
 
-  cdev_init(&dev->cdev_modeset, &nvgpu_modeset_fops);
-  dev->cdev_modeset.owner = THIS_MODULE;
-  ret = cdev_add(&dev->cdev_modeset, dev->modeset_devno, 1);
-  if (ret)
-    goto err_gpu_modeset;
+    cdev_init(&dev->cdev_modeset, &nvgpu_modeset_fops);
+    dev->cdev_modeset.owner = THIS_MODULE;
+    ret = cdev_add(&dev->cdev_modeset, dev->modeset_devno, 1);
+    if (ret)
+      goto err_gpu_modeset;
 
-  device_create(nvgpu_class, &vdev->dev, dev->modeset_devno, NULL,
-                "nvidia-modeset");
-  dev_info(&vdev->dev,
-           "virtio-gpu-nv: registered /dev/nvidia-modeset (%u:%u)\n",
-           MAJOR(dev->modeset_devno), MINOR(dev->modeset_devno));
+    device_create(nvgpu_class, &vdev->dev, dev->modeset_devno, NULL,
+                  "nvidia-modeset");
+    dev->has_modeset = true;
+    dev_info(&vdev->dev,
+             "virtio-gpu-nv: registered /dev/nvidia-modeset (%u:%u)\n",
+             MAJOR(dev->modeset_devno), MINOR(dev->modeset_devno));
+  }
 
   /* Register /dev/nvidia-caps/nvidia-cap{1,2} */
   dev->caps_devno = MKDEV(NV_CAPS_MAJOR, 1);
@@ -4545,17 +4574,24 @@ static int nvgpu_probe(struct virtio_device *vdev) {
 
   nvgpu_module_sysfs_init(dev);
 
-  /* Create /dev/dri/renderD128 etc. with host major:minor */
-  nvgpu_dri_init(dev); /* non-fatal */
+  /*
+   * /dev/dri/renderD128 etc. with host major:minor, with graphics. A backend
+   * without graphics also lists no render nodes, so an older module that
+   * ignores caps creates none either.
+   */
+  if (dev->caps & NVGPU_CAP_GRAPHICS)
+    nvgpu_dri_init(dev); /* non-fatal */
 
   dev_info(&vdev->dev, "virtio-gpu-nv: %u GPU(s), driver %s\n", dev->num_gpus,
            dev->driver_version);
   return 0;
 
 err_gpu_modeset:
-  unregister_chrdev_region(dev->modeset_devno, 1);
+  if (dev->caps & NVGPU_CAP_GRAPHICS)
+    unregister_chrdev_region(dev->modeset_devno, 1);
 err_uvm_region:
-  unregister_chrdev_region(dev->uvm_devno, 2);
+  if (dev->caps & NVGPU_CAP_COMPUTE)
+    unregister_chrdev_region(dev->uvm_devno, 2);
 err_uvm_cdev:
 err_ctl_cdev:
   cdev_del(&dev->cdev_ctl);
@@ -4587,9 +4623,11 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   nvgpu_module_sysfs_cleanup();
   nvgpu_pci_cleanup(dev);
 
-  device_destroy(nvgpu_class, dev->modeset_devno);
-  cdev_del(&dev->cdev_modeset);
-  unregister_chrdev_region(dev->modeset_devno, 1);
+  if (dev->has_modeset) {
+    device_destroy(nvgpu_class, dev->modeset_devno);
+    cdev_del(&dev->cdev_modeset);
+    unregister_chrdev_region(dev->modeset_devno, 1);
+  }
 
   for (i = 0; i < (int)dev->num_gpus; i++) {
     device_destroy(nvgpu_class, MKDEV(NV_MAJOR, i));
@@ -4601,10 +4639,13 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   cdev_del(&dev->cdev_ctl);
   unregister_chrdev_region(MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
 
-  device_destroy(nvgpu_class, dev->uvm_devno);
-  device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
-  cdev_del(&dev->cdev_uvm);
-  unregister_chrdev_region(dev->uvm_devno, 2);
+  if (dev->has_uvm) {
+    device_destroy(nvgpu_class, dev->uvm_devno);
+    if (dev->has_uvm_tools)
+      device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
+    cdev_del(&dev->cdev_uvm);
+    unregister_chrdev_region(dev->uvm_devno, 2);
+  }
 
   /* nvidia-caps cleanup */
   if (nvgpu_caps_class) {
@@ -4649,11 +4690,13 @@ static unsigned int virtio_id = VIRTIO_ID_GPU_NV;
 module_param(virtio_id, uint, 0444);
 MODULE_PARM_DESC(virtio_id, "virtio device ID to bind (default 45)");
 
+/*
+ * No device feature bits. What the backend serves travels in config `caps`;
+ * three feature bits were declared here once, and nothing offered or tested
+ * them.
+ */
 static unsigned int features[] = {
     VIRTIO_F_VERSION_1,
-    VIRTIO_GPU_NV_F_UVM,
-    VIRTIO_GPU_NV_F_ENCODE,
-    VIRTIO_GPU_NV_F_GRAPHICS,
 };
 
 static struct virtio_driver nvgpu_driver = {
