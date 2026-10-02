@@ -325,6 +325,76 @@ mod tests {
         assert_eq!(status, 0x22, "NV_ERR_INVALID_CLASS in NVOS64.status");
     }
 
+    /// A fake host driver: records every request that reaches it and answers
+    /// each one successfully without touching the parameters.
+    #[derive(Clone, Default)]
+    struct CountingHost(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
+
+    impl HostDriver for CountingHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, _arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.0.lock().unwrap().push(request);
+            Ok(())
+        }
+    }
+
+    impl CountingHost {
+        fn calls(&self) -> Vec<u64> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn backend_on(host: &CountingHost) -> (NvidiaBackend, u64) {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+        (be, h)
+    }
+
+    /// The seam itself: an allocation the guest may make reaches the host
+    /// exactly once, through the trait and not around it.
+    #[test]
+    fn a_served_alloc_reaches_the_host_once() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_caps(crate::caps::Caps::parse("graphics,video").unwrap());
+
+        let mut nvos64 = vec![0u8; 48];
+        nvos64[12..16].copy_from_slice(&0xc7b7u32.to_le_bytes());
+        let mut resp = vec![0u8; 256];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos64),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.calls().len(), 1, "one host call: {:x?}", host.calls());
+    }
+
+    /// The other side of the seam: a refusal for want of a capability is
+    /// answered here, and the fake proves the host never heard of it.
+    #[test]
+    fn a_caps_refusal_never_reaches_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_caps(crate::caps::Caps::parse("graphics,compute").unwrap());
+
+        let mut nvos64 = vec![0u8; 48];
+        nvos64[12..16].copy_from_slice(&0xc7b7u32.to_le_bytes());
+        let mut resp = vec![0u8; 256];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos64),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert!(
+            host.calls().is_empty(),
+            "host was called: {:x?}",
+            host.calls()
+        );
+    }
+
     #[test]
     fn a_release_older_than_every_profile_is_refused() {
         use abi::version::DriverVersion as V;

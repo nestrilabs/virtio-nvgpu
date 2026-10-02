@@ -412,9 +412,7 @@ impl NvidiaBackend {
             }
 
             // Call host ioctl — paramsSize field is untouched (may be 0)
-            let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
-            if rc < 0 {
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if let Err(errno) = self.host.ioctl(host_fd, request, &mut outer) {
                 log::warn!("nested ioctl(0x{:x}) failed: errno={}", request, errno);
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
@@ -521,9 +519,7 @@ impl NvidiaBackend {
             self.write_ioctl_resp_deep(resp_buf, cookie, &combined, deep_reply)
         } else {
             // No nested params — straightforward passthrough
-            let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
-            if rc < 0 {
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if let Err(errno) = self.host.ioctl(host_fd, request, &mut outer) {
                 log::warn!(
                     "nested ioctl(0x{:x}) no-params failed: errno={}",
                     request,

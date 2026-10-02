@@ -288,6 +288,8 @@ pub struct NvidiaBackend {
     watch_added: Vec<(u32, RawFd)>,
     watch_removed: Vec<u32>,
     next_mapping_id: u32,
+    /// Where forwarded ioctls go. The host driver, except under test.
+    host: Box<dyn HostDriver>,
 }
 
 /// A placement the guest can hand back, and everything needed to undo it.
@@ -345,7 +347,13 @@ impl NvidiaBackend {
             handle_kinds: std::collections::HashMap::new(),
             driver: None,
             abi: None,
+            host: Box::new(RealHost),
         }
+    }
+
+    /// Send every forwarded ioctl to `host` instead of the host driver.
+    pub fn set_host(&mut self, host: Box<dyn HostDriver>) {
+        self.host = host;
     }
 
     /// Create a backend with the default 256 MiB zone split.
@@ -682,6 +690,8 @@ fn write_struct<T: Copy>(buf: &mut [u8], val: &T) -> usize {
 
 mod files;
 pub use files::FileTree;
+mod host;
+pub use host::{HostDriver, RealHost};
 mod ioctl;
 mod nested;
 mod open;

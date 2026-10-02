@@ -53,18 +53,12 @@ impl NvidiaBackend {
             // Leave other fields as-is, call host
         }
 
-        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
-        if rc < 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-
+        if let Err(errno) = self.host.ioctl(host_fd, request, &mut param_buf) {
             // Special handling: NV_ESC_SYS_PARAMS (0xd6) - retry on EBUSY
             if escape == 0xd6 && errno == libc::EBUSY && retry_with_v2 {
                 log::debug!("NV_ESC_SYS_PARAMS: got EBUSY, retrying with Cmd=2");
                 param_buf[0] = 2; // Try V2
-                let rc2 =
-                    unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
-                if rc2 < 0 {
-                    let errno2 = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if let Err(errno2) = self.host.ioctl(host_fd, request, &mut param_buf) {
                     log::warn!(
                         "ioctl(0x{:x}/0x{:02x}) retry failed: errno={}",
                         request,

@@ -48,10 +48,7 @@ impl NvidiaBackend {
         // what the host driver is being asked to read.
         if embedded < 0 {
             let mut param_buf = param_in.to_vec();
-            let rc =
-                unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
-            if rc < 0 {
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if let Err(errno) = self.host.ioctl(host_fd, request, &mut param_buf) {
                 log::warn!("ioctl(0x{request:x}) with no embedded fd failed: errno={errno}");
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
@@ -70,10 +67,7 @@ impl NvidiaBackend {
         let mut param_buf = param_in.to_vec();
         param_buf[fd_offset..fd_offset + 4].copy_from_slice(&(host_embedded as i32).to_le_bytes());
 
-        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
-
-        if rc < 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if let Err(errno) = self.host.ioctl(host_fd, request, &mut param_buf) {
             log::warn!("fd-carrying ioctl(0x{:x}) failed: errno={}", request, errno);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
@@ -135,9 +129,7 @@ impl NvidiaBackend {
         // Set pNewCpuAddress to host VA too (the host mapping didn't move)
         param_buf[24..32].copy_from_slice(&host_old.to_le_bytes());
 
-        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
-        if rc < 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if let Err(errno) = self.host.ioctl(host_fd, request, &mut param_buf) {
             log::warn!(
                 "UPDATE_DEVICE_MAPPING_INFO: host ioctl failed: errno={}",
                 errno
@@ -219,10 +211,7 @@ impl NvidiaBackend {
 
         // --- Step 2: Call host ioctl ---
 
-        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
-
-        if rc < 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if let Err(errno) = self.host.ioctl(host_fd, request, &mut param_buf) {
             log::warn!("NV_ESC_RM_MAP_MEMORY: host ioctl failed: errno={}", errno);
             // Restore guest handle before returning
             param_buf[FD_OFFSET..FD_OFFSET + 4]
@@ -408,10 +397,7 @@ impl NvidiaBackend {
                 // Forward with the guest value — host will reject but we
                 // report the error cleanly rather than crashing
                 let mut param_buf = param_in.to_vec();
-                let rc =
-                    unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
-                if rc < 0 {
-                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if let Err(errno) = self.host.ioctl(host_fd, request, &mut param_buf) {
                     return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
                 }
                 return self.write_ioctl_resp(resp_buf, cookie, &param_buf);
@@ -430,9 +416,7 @@ impl NvidiaBackend {
         let mut param_buf = param_in.to_vec();
         param_buf[16..24].copy_from_slice(&entry.host_p_linear_address.to_le_bytes());
 
-        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
-        if rc < 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if let Err(errno) = self.host.ioctl(host_fd, request, &mut param_buf) {
             log::warn!("UNMAP_MEMORY: host ioctl failed: errno={}", errno);
             // Restore the entry since unmap didn't happen
             self.active_maps.insert(guest_linear, entry);
