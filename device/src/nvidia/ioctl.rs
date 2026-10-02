@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// `NV01_ROOT`, `NV01_ROOT_NON_PRIV` and `NV01_ROOT_CLIENT`: the classes
+/// whose allocation makes a client.
+const ROOT_CLASSES: [u32; 3] = [0x0, 0x1, 0x41];
+
 impl NvidiaBackend {
     // ------------------------------------------------------------------
     // IOCTL — top-level
@@ -235,6 +239,61 @@ impl NvidiaBackend {
     }
 
     pub(super) fn handle_ioctl(
+        &mut self,
+        cookie: u64,
+        payload: &[u8],
+        resp_buf: &mut [u8],
+    ) -> usize {
+        let n = self.serve_ioctl(cookie, payload, resp_buf);
+        self.note_clients(payload, &resp_buf[..n]);
+        n
+    }
+
+    /// Keep the record of which RM clients were made on which control file,
+    /// read from what RM answered rather than what the guest asked: a root
+    /// allocation's handle is RM's to choose, and only a call that succeeded
+    /// made or freed anything.
+    ///
+    /// UVM calls name a control file and a client side by side, and RM takes
+    /// the pair on trust from UVM. This record is what lets the backend say
+    /// the client is one this VM was given on that file.
+    fn note_clients(&mut self, payload: &[u8], resp: &[u8]) {
+        let file = self.current_handle as u64;
+        if self.handle_kinds.get(&file) != Some(&DeviceKind::Ctl) {
+            return;
+        }
+        let req = read_struct::<IoctlReq>(payload, 0);
+        let request = req.cmd as u64;
+        if (request >> 8) & 0xFF != b'F' as u64 {
+            return;
+        }
+        let head = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        if resp.len() < head || read_struct::<MsgHeader>(resp, 0).status != 0 {
+            return;
+        }
+        let out = &resp[head..];
+        let word = |at: usize| u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+        match (request & 0xFF, out.len()) {
+            // NVOS21 is 32 bytes with status at 28; NVOS64 is 48 with status
+            // at 40. Both have hObjectNew at 8 and hClass at 12.
+            (0x2b, n) if n >= 32 => {
+                let status = if n >= 48 { word(40) } else { word(28) };
+                if status == NV_OK && ROOT_CLASSES.contains(&word(12)) {
+                    self.vram.client_opened(file, word(8));
+                }
+            }
+            // NVOS00: hRoot, hObjectParent, hObjectOld, status. Freeing the
+            // root frees the client.
+            (0x29, n) if n >= 16 => {
+                if word(12) == NV_OK && word(8) == word(0) {
+                    self.vram.client_freed(word(0));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn serve_ioctl(
         &mut self,
         cookie: u64,
         payload: &[u8],

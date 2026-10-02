@@ -102,6 +102,11 @@ impl NvidiaBackend {
             }
         }
 
+        // RM frees every client made on a control file when it closes.
+        if self.handle_kinds.get(&handle) == Some(&DeviceKind::Ctl) {
+            self.vram.file_closed(handle);
+        }
+
         match self.handles.remove(handle) {
             Ok(()) => {
                 log::debug!("close handle={handle}");

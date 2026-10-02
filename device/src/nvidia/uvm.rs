@@ -99,7 +99,7 @@ impl NvidiaBackend {
         let mut restore: Vec<(usize, [u8; 4])> = Vec::new();
         for slot in entry.fds {
             let raw = i32::from_le_bytes(param_buf[slot.at..slot.at + 4].try_into().unwrap());
-            let host = match self.uvm_descriptor(slot, raw) {
+            let host = match self.uvm_descriptor(slot, raw, &param_buf) {
                 Ok(fd) => fd,
                 Err(why) => {
                     self.note_allow_refusal(format!("UVM {num:#x}"), why);
@@ -159,6 +159,7 @@ impl NvidiaBackend {
         &self,
         slot: &abi::uvm::FdSlot,
         raw: i32,
+        params: &[u8],
     ) -> std::result::Result<i32, String> {
         use abi::uvm::Fd;
 
@@ -195,12 +196,27 @@ impl NvidiaBackend {
             Fd::Foreign => unreachable!("returned above"),
         };
         match self.handle_kinds.get(&guest) {
-            Some(k) if *k == want => Ok(fd),
-            other => Err(format!(
-                "it wants {want:?} at byte {} and descriptor {guest} is {other:?}",
-                slot.at
-            )),
+            Some(k) if *k == want => {}
+            other => {
+                return Err(format!(
+                    "it wants {want:?} at byte {} and descriptor {guest} is {other:?}",
+                    slot.at
+                ))
+            }
         }
+
+        // UVM hands the pair to RM, and RM resolves the client through the
+        // file. A client made on another of this VM's files, or one RM never
+        // issued here at all, is a different call than the one checked above.
+        if let Some(at) = slot.handle {
+            let client = u32::from_le_bytes(params[at..at + 4].try_into().unwrap());
+            if !self.vram.issued(guest, client) {
+                return Err(format!(
+                    "client {client:#x} at byte {at} was not made on descriptor {guest}"
+                ));
+            }
+        }
+        Ok(fd)
     }
 
     /// Whether this UVM file's VA space refuses pageable access.

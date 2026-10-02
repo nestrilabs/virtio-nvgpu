@@ -230,6 +230,21 @@ impl Vram {
         }
     }
 
+    /// Whether `client` was made on the open file `file` and is still alive.
+    /// A UVM call names a control file and a client side by side, and this
+    /// is what says the two belong together.
+    pub fn issued(&self, file: u64, client: Client) -> bool {
+        self.files.get(&file).is_some_and(|v| v.contains(&client))
+    }
+
+    /// `client` itself was freed, on whichever file it was made on.
+    pub fn client_freed(&mut self, client: Client) {
+        for v in self.files.values_mut() {
+            v.retain(|&c| c != client);
+        }
+        self.freed(client, client);
+    }
+
     /// The open file `file` was closed: RM frees every client made on it.
     pub fn file_closed(&mut self, file: u64) {
         for client in self.files.remove(&file).unwrap_or_default() {
@@ -396,6 +411,26 @@ mod tests {
         v.allocated(C, SUB, 0x10, Some(32 * MIB));
         v.allocated(C, SUB, 0x10, Some(8 * MIB));
         assert_eq!(v.in_use(), 8 * MIB);
+    }
+
+    #[test]
+    fn a_client_is_issued_only_on_the_file_it_was_made_on() {
+        let mut v = Vram::new(None);
+        v.client_opened(7, C);
+        assert!(v.issued(7, C));
+        assert!(!v.issued(8, C), "another file");
+        assert!(!v.issued(7, C + 1), "another client");
+    }
+
+    #[test]
+    fn a_freed_or_closed_client_is_no_longer_issued() {
+        let mut v = Vram::new(None);
+        v.client_opened(7, C);
+        v.client_freed(C);
+        assert!(!v.issued(7, C));
+        v.client_opened(7, C);
+        v.file_closed(7);
+        assert!(!v.issued(7, C));
     }
 
     #[test]

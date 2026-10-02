@@ -1776,9 +1776,8 @@ mod tests {
         let (mut be, uvm, ctl) = uvm_backend(&host, v615());
         let host_ctl = be.handles.get_raw(ctl).expect("the control file is open");
 
-        let mut p = vec![0u8; 40];
-        p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&(ctl as i32).to_le_bytes());
-        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &p);
+        rm_client(&mut be, ctl, CLIENT);
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &register_gpu(ctl, CLIENT));
         assert_eq!(parse_resp(&resp).status, 0);
 
         let (_, sent) = host.calls().pop().expect("one call");
@@ -1799,6 +1798,109 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(back, ctl as i32, "the guest reads back the number it wrote");
+    }
+
+    const CLIENT: u32 = 0xc1d0_0001;
+    const RM_ALLOC: u64 = 0xc030_462b; // _IOWR('F', 0x2b, NVOS64)
+    const RM_FREE: u64 = 0xc010_4629; // _IOWR('F', 0x29, NVOS00)
+
+    fn rm_on(be: &mut NvidiaBackend, h: u64, cmd: u64, params: &[u8]) -> i32 {
+        let mut v = hdr(MsgType::Ioctl, h);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: cmd as u32,
+                data_len: params.len() as u32,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(params);
+        let mut resp = vec![0u8; 64 * 1024];
+        be.dispatch(&v, &mut resp);
+        parse_resp(&resp).status
+    }
+
+    /// Allocate root client `client` on file `h`, as RM would answer it.
+    fn rm_client(be: &mut NvidiaBackend, h: u64, client: u32) {
+        let mut p = [0u8; 48];
+        p[8..12].copy_from_slice(&client.to_le_bytes());
+        p[12..16].copy_from_slice(&0x41u32.to_le_bytes());
+        assert_eq!(rm_on(be, h, RM_ALLOC, &p), 0);
+    }
+
+    fn register_gpu(ctl: u64, client: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&(ctl as i32).to_le_bytes());
+        p[REGISTER_GPU_FD + 4..REGISTER_GPU_FD + 8].copy_from_slice(&client.to_le_bytes());
+        p
+    }
+
+    /// The descriptor is checked, and so is the client beside it: RM resolves
+    /// the one through the other, so a client this file was never given is a
+    /// call on someone else's objects.
+    #[test]
+    fn a_client_the_control_file_was_never_given_is_refused() {
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &register_gpu(ctl, CLIENT));
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    #[test]
+    fn a_client_made_on_another_control_file_is_refused() {
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let other = be.handles.insert(OwnedFd::from(null));
+        be.handle_kinds.insert(other, DeviceKind::Ctl);
+        rm_client(&mut be, other, CLIENT);
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &register_gpu(ctl, CLIENT));
+        assert_ne!(parse_resp(&resp).status, 0);
+        let nums = host.nums();
+        assert!(!nums.contains(&UVM_REGISTER_GPU), "host heard {nums:x?}");
+    }
+
+    #[test]
+    fn a_freed_client_is_refused() {
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        rm_client(&mut be, ctl, CLIENT);
+        let mut free = [0u8; 16];
+        free[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+        free[8..12].copy_from_slice(&CLIENT.to_le_bytes());
+        assert_eq!(rm_on(&mut be, ctl, RM_FREE, &free), 0);
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &register_gpu(ctl, CLIENT));
+        assert_ne!(parse_resp(&resp).status, 0);
+    }
+
+    /// The record follows RM's answer: a root allocation RM refused made no
+    /// client, whatever handle the guest wrote.
+    #[test]
+    fn a_refused_root_allocation_issues_nothing() {
+        #[derive(Clone, Default)]
+        struct Refuses;
+        impl HostDriver for Refuses {
+            fn ioctl(&self, _: RawFd, req: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+                if req & 0xff == 0x2b && arg.len() >= 44 {
+                    arg[40..44].copy_from_slice(&0x57u32.to_le_bytes());
+                }
+                Ok(())
+            }
+        }
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        be.set_host(Box::new(Refuses));
+        let mut p = [0u8; 48];
+        p[8..12].copy_from_slice(&CLIENT.to_le_bytes());
+        p[12..16].copy_from_slice(&0x41u32.to_le_bytes());
+        rm_on(&mut be, ctl, RM_ALLOC, &p);
+        be.set_host(Box::new(host.clone()));
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &register_gpu(ctl, CLIENT));
+        assert_ne!(parse_resp(&resp).status, 0);
     }
 
     /// A call wanting `nvidiactl` handed a UVM file is a different call than
