@@ -124,9 +124,12 @@ do_check() {
         cargo clippy --workspace --all-targets --features device/vhost-user --quiet > out-clippy.log 2>&1 \\
             || { echo '== clippy'; grep -E '^(error|warning)' -A6 out-clippy.log | head -n 60; rc=1; }
         echo \"clippy: \$(grep -cE '^warning' out-clippy.log) warning(s), see ~/$BUILD_DIR/out-clippy.log\"
-        cargo test --workspace --quiet > out-test.log 2>&1 \\
-            || { echo '== test'; grep -E 'FAILED|panicked|^error' -A8 out-test.log | head -n 60; rc=1; }
-        grep -E '^test result' out-test.log | awk '{p+=\$4; f+=\$6} END {print \"tests: \" p \" passed, \" f \" failed\"}'
+        # A crate whose test binary dies on a signal prints no 'test result'
+        # line at all, so the summary below silently shrinks rather than going
+        # red. Carry cargo's own verdict into it.
+        cargo test --workspace --quiet > out-test.log 2>&1 && trc=0 || trc=1
+        [ \$trc -eq 0 ] || { echo '== test'; grep -E 'FAILED|panicked|^error|signal:' -A8 out-test.log | head -n 60; rc=1; }
+        grep -E '^test result' out-test.log | awk -v trc=\$trc '{p+=\$4; f+=\$6} END {print \"tests: \" p \" passed, \" f \" failed\" (trc ? \" -- AND CARGO REPORTED FAILURE: a crate may have crashed before reporting\" : \"\")}'
         cargo build --release --target $MUSL --features vhost-user -p device --bins --quiet > out-build.log 2>&1 \\
             || { echo '== musl build'; grep -E '^error' -A12 out-build.log | head -n 60; rc=1; }
         exit \$rc
