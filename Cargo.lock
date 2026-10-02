@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abi"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "aho-corasick"
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "device"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "abi",
  "anyhow",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "nvgpu-vklayer"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "once_cell"
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "quote"
