@@ -15,6 +15,9 @@
 //! that asks for them anyway with `VK_ERROR_EXTENSION_NOT_PRESENT`, which an
 //! application handles, instead of the driver's failure, which it does not.
 //!
+//! Only NVIDIA devices in a guest with the virtio-nvgpu driver are touched:
+//! the same guest image runs on AMD and Intel boxes, whose ray tracing works.
+//!
 //! Nothing here is a security boundary: the backend's checks are. This only
 //! makes the guest's Vulkan say what it can do.
 //!
@@ -53,6 +56,7 @@ type PFN_vkEnumerateDeviceExtensionProperties = unsafe extern "system" fn(
     *mut u32,
     *mut ExtensionProperties,
 ) -> VkResult;
+type PFN_vkGetPhysicalDeviceProperties = unsafe extern "system" fn(Handle, *mut c_void);
 type PFN_vkGetPhysicalDeviceFeatures2 = unsafe extern "system" fn(Handle, *mut BaseOut);
 
 const LAYER_NAME: &CStr = c"VK_LAYER_NVGPU_no_uvm";
@@ -99,8 +103,31 @@ const FEATURES: &[(i32, usize)] = &[
 /// the layer disabled.
 const UVM_SERVES_VULKAN: bool = false;
 
-fn hiding() -> bool {
+/// Whether this guest reaches its GPU through virtio-nvgpu. The guest image
+/// is shared with AMD and Intel boxes, whose drivers do ray tracing and must
+/// keep it; only a guest whose NVIDIA device is forwarded is affected. The
+/// driver is built in, and a built-in module with parameters is still listed.
+fn forwarded_guest() -> bool {
+    std::path::Path::new("/sys/module/virtio_gpu_nv").exists()
+}
+
+fn uvm_lacking() -> bool {
     !UVM_SERVES_VULKAN || !std::path::Path::new("/dev/nvidia-uvm").exists()
+}
+
+const NVIDIA: u32 = 0x10de;
+
+/// Whether to hide from this physical device: an NVIDIA one, in a forwarded
+/// guest that cannot serve these extensions.
+unsafe fn hiding(i: &Instance, pd: Handle) -> bool {
+    if !forwarded_guest() || !uvm_lacking() {
+        return false;
+    }
+    // VkPhysicalDeviceProperties is under 1 KiB; vendorID is its third u32.
+    let mut props = [0u64; 128];
+    unsafe { (i.props)(pd, props.as_mut_ptr() as *mut c_void) };
+    let vendor = (props[1] & 0xffff_ffff) as u32;
+    vendor == NVIDIA
 }
 
 pub fn is_hidden(name: &[u8]) -> bool {
@@ -191,6 +218,7 @@ struct Instance {
     destroy: PFN_vkDestroyInstance,
     enum_ext: PFN_vkEnumerateDeviceExtensionProperties,
     features2: Option<PFN_vkGetPhysicalDeviceFeatures2>,
+    props: PFN_vkGetPhysicalDeviceProperties,
 }
 
 static INSTANCES: Mutex<Vec<Instance>> = Mutex::new(Vec::new());
@@ -344,9 +372,10 @@ unsafe extern "system" fn create_instance(
             return r;
         }
         let inst = *out;
-        let (Some(destroy), Some(enum_ext)) = (
+        let (Some(destroy), Some(enum_ext), Some(props)) = (
             load(gipa, inst, c"vkDestroyInstance"),
             load(gipa, inst, c"vkEnumerateDeviceExtensionProperties"),
+            load(gipa, inst, c"vkGetPhysicalDeviceProperties"),
         ) else {
             return VK_ERROR_INITIALIZATION_FAILED;
         };
@@ -359,6 +388,7 @@ unsafe extern "system" fn create_instance(
             destroy,
             enum_ext,
             features2,
+            props,
         });
         r
     }
@@ -399,7 +429,7 @@ unsafe extern "system" fn enumerate_device_extensions(
         let Some(i) = instance(key(pd)) else {
             return VK_ERROR_INITIALIZATION_FAILED;
         };
-        if !hiding() {
+        if !hiding(&i, pd) {
             return (i.enum_ext)(pd, layer, count, props);
         }
         let mut n = 0u32;
@@ -461,11 +491,10 @@ pub unsafe fn copy_out(
 
 unsafe extern "system" fn features2(pd: Handle, out: *mut BaseOut) {
     unsafe {
-        let Some(f) = instance(key(pd)).and_then(|i| i.features2) else {
-            return;
-        };
+        let Some(i) = instance(key(pd)) else { return };
+        let Some(f) = i.features2 else { return };
         f(pd, out);
-        if hiding() {
+        if hiding(&i, pd) {
             clear_features(out as *mut c_void);
         }
     }
@@ -497,7 +526,10 @@ unsafe extern "system" fn create_device(
     out: *mut Handle,
 ) -> VkResult {
     unsafe {
-        if hiding() && asks_hidden(&*ci) {
+        let Some(inst) = instance(key(pd)) else {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        };
+        if hiding(&inst, pd) && asks_hidden(&*ci) {
             return VK_ERROR_EXTENSION_NOT_PRESENT;
         }
         let chain = find_link::<LayerDeviceLink>((*ci).p_next, LOADER_DEVICE_CREATE_INFO);
@@ -507,9 +539,6 @@ unsafe extern "system" fn create_device(
         let link = &*(*chain).link;
         let (gipa, gdpa) = (link.next_gipa, link.next_gdpa);
         (*chain).link = link.p_next;
-        let Some(inst) = instance(key(pd)) else {
-            return VK_ERROR_INITIALIZATION_FAILED;
-        };
         let Some(create) =
             load::<PFN_vkCreateDevice>(gipa, inst.handle as Handle, c"vkCreateDevice")
         else {
