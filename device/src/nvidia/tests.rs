@@ -1573,6 +1573,51 @@ mod tests {
         assert_eq!(host.calls().len(), 1, "host heard {:x?}", host.calls());
     }
 
+    /// The discriminator is exactly one function wide, and stays that way.
+    ///
+    /// This sweeps every function number the field can plausibly carry and
+    /// holds the backend to refusing one of them. The draw probe's 180
+    /// unrefused `VID_HEAP_CONTROL` calls say the same thing on hardware, but
+    /// only for the functions that probe happens to use, and only when someone
+    /// remembers to look. A check that grows by one function silently costs
+    /// video memory allocation; a check that shrinks by one reopens the hole.
+    /// Both fail here instead.
+    #[test]
+    fn exactly_one_heap_function_is_the_one_that_names_an_address() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let d = osdesc();
+        let f = d.vid_heap_function_at;
+
+        let mut refused = Vec::new();
+        for func in 0u32..64 {
+            let mut p = vec![0u8; d.vid_heap.params_size];
+            p[f..f + 4].copy_from_slice(&func.to_le_bytes());
+            // An address in every one of them, so what decides is the function
+            // and never the bytes that happen to sit at the address offset.
+            p[d.vid_heap.address_at..d.vid_heap.address_at + 8]
+                .copy_from_slice(&0x4000_0000u64.to_le_bytes());
+
+            let before = host.calls().len();
+            let mut resp = vec![0u8; 4096];
+            be.dispatch(
+                &ioctl_msg(h, abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL, &p),
+                &mut resp,
+            );
+            assert_eq!(parse_resp(&resp).status, 0, "function {func}");
+            if host.calls().len() == before {
+                refused.push(func);
+            }
+        }
+
+        assert_eq!(
+            refused,
+            vec![d.vid_heap_function],
+            "only NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR ({}) may be refused here",
+            d.vid_heap_function
+        );
+    }
+
     /// And an allocation of some other class is untouched by any of this.
     #[test]
     fn an_allocation_of_another_class_is_not_mistaken_for_a_registration() {
