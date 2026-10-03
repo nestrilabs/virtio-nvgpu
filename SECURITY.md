@@ -90,8 +90,6 @@ These are open on this branch. Until they land, treat a guest as able to reach
 the backend process itself, and treat the backend as able to reach everything
 its user can.
 
-- UVM size tables. UVM ioctls are not yet checked against per-release sizes,
-  which is one reason compute is opt-in.
 - Memory RM allocates inside other objects. Channel and context buffers are
   made by RM on the guest's behalf and never appear as a sized allocation,
   so the video-memory limit does not count them: about 34 MiB for one
