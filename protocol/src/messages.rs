@@ -341,7 +341,10 @@ mod tests {
         assert_eq!(DeviceKind::from_device_type(3), Some(DeviceKind::Gpu(3)));
         assert_eq!(DeviceKind::from_device_type(255), Some(DeviceKind::Ctl));
         assert_eq!(DeviceKind::from_device_type(256), Some(DeviceKind::Uvm));
-        assert_eq!(DeviceKind::from_device_type(257), Some(DeviceKind::UvmTools));
+        assert_eq!(
+            DeviceKind::from_device_type(257),
+            Some(DeviceKind::UvmTools)
+        );
         assert_eq!(DeviceKind::from_device_type(258), Some(DeviceKind::Modeset));
     }
 

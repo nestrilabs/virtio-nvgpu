@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use device::caps::Caps;
 use device::host;
 use device::nvidia::NvidiaBackend;
 use device::shm::WindowPlacer;
@@ -39,7 +40,8 @@ use virtio_bindings::bindings::virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::QueueOwnedT;
 use vm_memory::{
-    Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
+    Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend,
+    GuestMemoryLoadGuard, GuestMemoryMmap, GuestMemoryRegion,
 };
 
 /// The driver calls `virtio_find_vqs(vdev, 2, ...)` and fails probe on the
@@ -60,31 +62,16 @@ struct Args {
     #[arg(long, default_value = host::PROC_NVIDIA)]
     proc_nvidia: PathBuf,
 
-    /// Forward ioctls the ABI profile does not describe instead of refusing
-    /// them, and report what was forwarded at teardown.
-    ///
-    /// For finding out what a workload needs that the tables lack. It hands a
-    /// guest the parts of the host driver's interface nobody has checked, so it
-    /// is not a way to run one.
-    #[arg(long)]
-    permissive_abi: bool,
+    /// What the guest is served: a comma list of graphics, compute, video and
+    /// utility. Compute (CUDA, through nvidia-uvm) is off unless named.
+    #[arg(long, default_value_t = Caps::DEFAULT, value_parser = Caps::parse)]
+    caps: Caps,
 
-    /// Serve a guest although the backend runs as root or with CAP_SYS_ADMIN.
-    ///
-    /// The host driver takes a guest's privilege from the backend's, so every
-    /// guest process is then an RM administrator. For a test rig that cannot
-    /// do otherwise; never for a guest you do not trust.
-    #[arg(long)]
-    allow_root_unsafe: bool,
-
-    /// Serve `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools`, which CUDA needs.
-    ///
-    /// Off by default. UVM's calls are forwarded without a table of their
-    /// sizes, and six of them carry a descriptor number that is not
-    /// translated, so the host reads it in the backend's own descriptor
-    /// table. Compute is served properly from v0.2.
-    #[arg(long)]
-    allow_uvm_unsafe: bool,
+    /// Video memory the guest may hold, in MiB. Omitted, it may take the
+    /// whole card. The limit is announced in device config, so a VMM given
+    /// one refuses to start a guest on a backend that is not enforcing it.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    vram_limit_mib: Option<u64>,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -92,6 +79,36 @@ struct Args {
 /// The VMM owns the window's address space and the memory slot that describes
 /// it, so it is the only process whose `MAP_FIXED` the guest can see. This
 /// hands the descriptor over and lets it do the placement.
+/// Guest RAM, as the backend can map from it.
+///
+/// A vhost-user frontend sends each region as a file descriptor, and
+/// `vhost-user-backend` builds every region with `MmapRegion::from_file`, so
+/// the fd and the offset within it survive into here. That is what makes a
+/// host address aliasing a guest's own pages possible at all; without the fd
+/// there would be only this process's mapping, which cannot be re-mapped
+/// somewhere else.
+///
+/// Holds the atomic handle rather than a snapshot, so a memory table replaced
+/// after this was built is seen rather than silently stale.
+struct VhostGuestRam(GuestMemoryAtomic<GuestMemoryMmap>);
+
+impl device::guestmem::GuestRam for VhostGuestRam {
+    fn backing(&self, gpa: u64) -> Option<device::guestmem::Backing> {
+        let mem = self.0.memory();
+        let region = mem.find_region(GuestAddress(gpa))?;
+        // A region the frontend sent without a descriptor cannot be mapped
+        // from, only read through. None has been seen, and a registration is
+        // refused rather than served from a mapping we cannot alias.
+        let file = region.file_offset()?;
+        let within = gpa.checked_sub(region.start_addr().raw_value())?;
+        Some(device::guestmem::Backing {
+            fd: file.file().try_clone().ok()?.into(),
+            offset: file.start().checked_add(within)?,
+            len: region.len().checked_sub(within)?,
+        })
+    }
+}
+
 struct VhostWindow(Backend);
 
 impl WindowPlacer for VhostWindow {
@@ -130,6 +147,40 @@ impl WindowPlacer for VhostWindow {
             padding: [0; 7],
             fd_offset: 0,
             shm_offset,
+            len,
+            flags: 0,
+        };
+        self.0
+            .shmem_unmap(&req)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
+
+    fn place_pool(&self, offset: u64, len: u64, fd: RawFd, addr: u64) -> device::error::Result<()> {
+        // On the aperture, fd_offset is the pool's host address as well as
+        // its offset in the file: UVM takes the mapping nowhere else.
+        let req = VhostUserMMap {
+            shmid: NV_SHM_ID_APERTURE,
+            padding: [0; 7],
+            fd_offset: addr,
+            shm_offset: offset,
+            len,
+            flags: VhostUserMMapFlags::WRITABLE.bits(),
+        };
+        // SAFETY: as in `place`.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        self.0
+            .shmem_map(&req, &borrowed)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
+
+    fn withdraw_pool(&self, offset: u64, len: u64) -> device::error::Result<()> {
+        let req = VhostUserMMap {
+            shmid: NV_SHM_ID_APERTURE,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset: offset,
             len,
             flags: 0,
         };
@@ -314,6 +365,8 @@ const EVENT_QUEUE: usize = 1;
 /// The shared-memory id the guest driver looks the window up by, which must
 /// match the capability the VMM publishes.
 const NV_SHM_ID: u8 = 1;
+/// The UVM aperture, where semaphore pools are placed. See `device/src/nvidia/aperture.rs`.
+const NV_SHM_ID_APERTURE: u8 = 2;
 
 struct NvGpuBackend {
     nvidia: Arc<Mutex<NvidiaBackend>>,
@@ -323,6 +376,11 @@ struct NvGpuBackend {
     /// Started on the first message, because the event queue and guest memory
     /// are not known before then.
     watches: Option<Sender<Watch>>,
+    /// The request and response of the chain being served, kept across chains.
+    /// A fresh 64 KiB response zeroed per request cost more than the host's
+    /// whole RM call, and only the bytes dispatch writes are sent back.
+    req: Vec<u8>,
+    resp: Vec<u8>,
 }
 
 impl NvGpuBackend {
@@ -331,11 +389,7 @@ impl NvGpuBackend {
     /// The guest driver rejects `num_gpus == 0`, so a host with no NVIDIA
     /// module loaded is refused here, where the reason can be stated, rather
     /// than in a guest as a bare -EINVAL from probe.
-    fn new(
-        proc_nvidia: &Path,
-        abi_policy: device::nvidia::AbiPolicy,
-        allow_uvm: bool,
-    ) -> anyhow::Result<Self> {
+    fn new(proc_nvidia: &Path, caps: Caps, vram_limit_mib: Option<u64>) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
                 "no NVIDIA driver version at {} -- is the kernel module loaded?",
@@ -355,9 +409,12 @@ impl NvGpuBackend {
         nvidia
             .set_host_driver_version(release)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
-        nvidia.set_abi_policy(abi_policy);
-        nvidia.set_allow_uvm(allow_uvm);
+        nvidia.set_caps(caps);
+        nvidia
+            .set_vram_limit_mib(vram_limit_mib)
+            .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
 
+        let nvidia_vram_mib = nvidia.vram_limit_mib();
         Ok(Self {
             nvidia: Arc::new(Mutex::new(nvidia)),
             mem: None,
@@ -365,8 +422,10 @@ impl NvGpuBackend {
             // Phase A forwards ioctls only. nvidia-smi needs no mapping at all
             // -- 100 ioctls and one mmap in the captured trace -- so a guest
             // can enumerate the GPU before the shared window exists.
-            config: VirtioGpuNvConfig::new(&version, &gpus),
+            config: VirtioGpuNvConfig::new(&version, &gpus, caps, nvidia_vram_mib),
             watches: None,
+            req: Vec::new(),
+            resp: vec![0u8; RESP_MAX],
         })
     }
 
@@ -433,30 +492,31 @@ impl NvGpuBackend {
             drop(guard);
 
             let head = chain.head_index();
-            let mut req = Vec::new();
             let mut resp_desc = None;
+            self.req.clear();
 
             for desc in chain.clone() {
                 if desc.is_write_only() {
                     resp_desc = Some(desc);
                 } else {
-                    let mut buf = vec![0u8; desc.len() as usize];
-                    mem.read_slice(&mut buf, desc.addr()).map_err(|e| {
-                        std::io::Error::other(format!("read request descriptor: {e}"))
-                    })?;
-                    req.extend_from_slice(&buf);
+                    let at = self.req.len();
+                    self.req.resize(at + desc.len() as usize, 0);
+                    mem.read_slice(&mut self.req[at..], desc.addr())
+                        .map_err(|e| {
+                            std::io::Error::other(format!("read request descriptor: {e}"))
+                        })?;
                 }
             }
 
             let written = match resp_desc {
                 Some(d) => {
                     let cap = std::cmp::min(d.len() as usize, RESP_MAX);
-                    let mut resp = vec![0u8; cap];
+                    let resp = &mut self.resp[..cap];
                     let n = self
                         .nvidia
                         .lock()
                         .expect("backend mutex")
-                        .dispatch(&req, &mut resp);
+                        .dispatch(&self.req, resp);
                     if n > 0 {
                         mem.write_slice(&resp[..n], d.addr()).map_err(|e| {
                             std::io::Error::other(format!("write response descriptor: {e}"))
@@ -527,6 +587,13 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn update_memory(&mut self, mem: GuestMemoryAtomic<GuestMemoryMmap>) -> std::io::Result<()> {
+        // Also the backend's, so memory a guest registers by CPU address can
+        // be found. The handle is atomic, so a later table replaces what this
+        // one sees rather than leaving the backend on a stale set of regions.
+        self.nvidia
+            .lock()
+            .unwrap()
+            .set_guest_ram(Box::new(VhostGuestRam(mem.clone())));
         self.mem = Some(mem);
         Ok(())
     }
@@ -588,22 +655,50 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     // Before any device is opened: the host driver judges every guest call by
     // this process's credentials (device::posture).
-    device::posture::enforce(args.allow_root_unsafe)?;
+    device::posture::enforce()?;
 
+    // The sandbox, before anything else: Landlock and seccomp cover this
+    // thread and every thread started after them, and `VhostUserDaemon::new`
+    // starts one. Everything the backend needs afterwards -- the GPU nodes,
+    // the driver's own trees, and the directory its socket is bound in -- is
+    // named here, because a ruleset cannot be added to once it is in force.
+    let socket_dir = Path::new(&args.socket)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let report = device::sandbox::enter(&device::sandbox::Paths {
+        devices: device::sandbox::gpu_nodes(),
+        read_only: vec![
+            args.proc_nvidia.clone(),
+            PathBuf::from("/sys/class/drm"),
+            PathBuf::from("/sys/bus/pci/devices"),
+            PathBuf::from("/sys/devices"),
+        ],
+        sockets: vec![socket_dir],
+    })?;
     log::info!(
-        "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}",
-        args.socket
+        "sandbox: landlock ABI {}, {} seccomp instructions; no path outside the GPU nodes, the \
+         driver's own trees and the socket's directory, no executable mapping, no process, no \
+         socket but AF_UNIX",
+        report.landlock_abi,
+        report.seccomp_rules
     );
 
-    let abi_policy = if args.permissive_abi {
-        device::nvidia::AbiPolicy::Permissive
-    } else {
-        device::nvidia::AbiPolicy::Enforce
-    };
+    log::info!(
+        "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}, {}",
+        args.socket,
+        args.caps,
+        match args.vram_limit_mib {
+            Some(m) => format!("video memory limited to {m} MiB"),
+            None => "no video memory limit".to_string(),
+        }
+    );
+
     let backend = Arc::new(RwLock::new(NvGpuBackend::new(
         &args.proc_nvidia,
-        abi_policy,
-        args.allow_uvm_unsafe,
+        args.caps,
+        args.vram_limit_mib,
     )?));
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.

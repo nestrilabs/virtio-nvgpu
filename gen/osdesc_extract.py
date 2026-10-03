@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Generate the three routes by which a guest can name memory by a CPU address.
+
+RM lets a caller hand it an address and say "this memory is mine, map it for
+the GPU". In a VM that is the sharpest edge in the whole interface: the
+address the guest writes is an address in the *guest's* process, and the
+address RM reads it as is one in the backend's. Forwarded untouched, a guest
+picks an address and the host's RM pins and maps whatever of the backend's
+memory happens to live there.
+
+    ./osdesc_extract.py --ogkm ~/forks/ogkm-615.71.09 --version 615.71.09 \\
+        > src/osdesc/v615_71_09.rs
+
+There are three routes, not one, and that is the reason this exists as a
+table rather than as a constant in the backend:
+
+  * `NV_ESC_RM_ALLOC` with `hClass` = `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR`,
+    whose parameters are `NV_OS_DESC_MEMORY_ALLOCATION_PARAMS`.
+  * `NV_ESC_RM_ALLOC_MEMORY` with the same class, whose parameters are
+    `NVOS02_PARAMETERS` -- a different struct with the address in a different
+    place.
+  * `NV_ESC_RM_VID_HEAP_CONTROL`, where the address is not in the parameters
+    at all until you read `function`: `NVOS32_PARAMETERS` is a union, and only
+    `NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR` puts an address in it.
+
+Every offset here is an `offsetof` and every size a `sizeof`, from a probe
+compiled against the release's own headers. Counting them by hand would have
+got the first one wrong: `NV_OS_DESC_MEMORY_ALLOCATION_PARAMS` begins with
+four `NvU32`s and the address is at byte 16, not 8, because `NvP64` carries
+`NV_ALIGN_BYTES(8)`.
+
+The descriptor *type* is read too. Only `VIRTUAL_ADDRESS` is a user address
+the guest could be describing; the other seven name a kernel address, a file
+handle, a dma-buf or a scatter-gather table, none of which a guest can hold
+and none of which this backend can translate.
+
+Needs: python3, cc.
+"""
+
+import argparse
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SDK = "src/common/sdk/nvidia/inc"
+
+# The descriptor types RM names. Read rather than listed so that a release
+# that adds one is noticed here instead of being forwarded as an integer the
+# backend has no opinion about.
+DESC_TYPE = re.compile(r"^#define\s+NVOS32_DESCRIPTOR_TYPE_(\w+)\s+(\d+)", re.M)
+FUNCTION = re.compile(r"^#define\s+NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR\s+(\d+)", re.M)
+CLASS = re.compile(r"^#define\s+NV01_MEMORY_SYSTEM_OS_DESCRIPTOR\s+\((0x[0-9a-fA-F]+)\)", re.M)
+
+PROBE = r"""
+#include <stddef.h>
+#include <stdio.h>
+#include "nvtypes.h"
+#include "nvos.h"
+#include "class/cl0071.h"
+
+int main(void) {
+#define P(n, v) printf("%s %zu\n", n, (size_t)(v))
+  P("alloc_params_size", sizeof(NV_OS_DESC_MEMORY_ALLOCATION_PARAMS));
+  P("alloc_address_at", offsetof(NV_OS_DESC_MEMORY_ALLOCATION_PARAMS, descriptor));
+  P("alloc_limit_at", offsetof(NV_OS_DESC_MEMORY_ALLOCATION_PARAMS, limit));
+  P("alloc_type_at", offsetof(NV_OS_DESC_MEMORY_ALLOCATION_PARAMS, descriptorType));
+
+  P("alloc_memory_size", sizeof(NVOS02_PARAMETERS));
+  P("alloc_memory_class_at", offsetof(NVOS02_PARAMETERS, hClass));
+  P("alloc_memory_address_at", offsetof(NVOS02_PARAMETERS, pMemory));
+  P("alloc_memory_limit_at", offsetof(NVOS02_PARAMETERS, limit));
+  P("alloc_memory_status_at", offsetof(NVOS02_PARAMETERS, status));
+
+  P("vid_heap_size", sizeof(NVOS32_PARAMETERS));
+  P("vid_heap_function_at", offsetof(NVOS32_PARAMETERS, function));
+  P("vid_heap_address_at", offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.descriptor));
+  P("vid_heap_limit_at", offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.limit));
+  P("vid_heap_type_at", offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.descriptorType));
+  P("vid_heap_status_at", offsetof(NVOS32_PARAMETERS, status));
+  P("vid_heap_hmemory_at", offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.hMemory));
+  return 0;
+}
+"""
+
+
+def constants(ogkm):
+    """The class, the heap function, and every descriptor type, from nvos.h."""
+    nvos = open(os.path.join(ogkm, SDK, "nvos.h"), encoding="utf-8", errors="replace").read()
+    cl = open(os.path.join(ogkm, SDK, "class/cl0071.h"), encoding="utf-8", errors="replace").read()
+
+    m = CLASS.search(cl)
+    if not m:
+        sys.exit("cl0071.h no longer defines NV01_MEMORY_SYSTEM_OS_DESCRIPTOR as a literal")
+    m2 = FUNCTION.search(nvos)
+    if not m2:
+        sys.exit("nvos.h no longer defines NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR")
+
+    types = {name: int(val) for name, val in DESC_TYPE.findall(nvos)}
+    if types.get("VIRTUAL_ADDRESS") != 0:
+        # The backend serves this one and refuses the rest, so which number it
+        # is decides what is served. A release that renumbered it would have
+        # the backend serving something else entirely.
+        sys.exit(f"NVOS32_DESCRIPTOR_TYPE_VIRTUAL_ADDRESS is {types.get('VIRTUAL_ADDRESS')}, not 0")
+    return int(m.group(1), 16), int(m2.group(1)), types
+
+
+def emit(v, cls, function, types, version, stream):
+    w = stream.write
+    w("// Generated by gen/osdesc_extract.py -- do not edit by hand.\n//\n")
+    w("//   ./osdesc_extract.py --ogkm <open-gpu-kernel-modules at %s> \\\n" % version)
+    w("//       --version %s > src/osdesc/v%s.rs\n//\n" % (version, version.replace(".", "_")))
+    w("// Where driver %s keeps the CPU address on each of the three routes\n" % version)
+    w("// that let a caller name memory by one.\n\n")
+    w("use super::{DescType, OsDesc, Route};\n\n")
+    w("pub static OSDESC: OsDesc = OsDesc {\n")
+    w("    class: %#010x,\n" % cls)
+    w("    virtual_address: %d,\n" % types["VIRTUAL_ADDRESS"])
+    w("    vid_heap_function: %d,\n" % function)
+    w("    alloc: Route {\n")
+    w("        params_size: %d,\n" % v["alloc_params_size"])
+    w("        address_at: %d,\n" % v["alloc_address_at"])
+    w("        limit_at: %d,\n" % v["alloc_limit_at"])
+    w("        type_at: %d,\n" % v["alloc_type_at"])
+    w("    },\n")
+    w("    alloc_memory: Route {\n")
+    w("        params_size: %d,\n" % v["alloc_memory_size"])
+    w("        address_at: %d,\n" % v["alloc_memory_address_at"])
+    w("        limit_at: %d,\n" % v["alloc_memory_limit_at"])
+    # NVOS02 has no descriptorType: the class alone says what it is.
+    w("        type_at: usize::MAX,\n")
+    w("    },\n")
+    w("    alloc_memory_class_at: %d,\n" % v["alloc_memory_class_at"])
+    w("    alloc_memory_status_at: %d,\n" % v["alloc_memory_status_at"])
+    w("    vid_heap: Route {\n")
+    w("        params_size: %d,\n" % v["vid_heap_size"])
+    w("        address_at: %d,\n" % v["vid_heap_address_at"])
+    w("        limit_at: %d,\n" % v["vid_heap_limit_at"])
+    w("        type_at: %d,\n" % v["vid_heap_type_at"])
+    w("    },\n")
+    w("    vid_heap_function_at: %d,\n" % v["vid_heap_function_at"])
+    w("    vid_heap_status_at: %d,\n" % v["vid_heap_status_at"])
+    w("    vid_heap_hmemory_at: %d,\n" % v["vid_heap_hmemory_at"])
+    w("    types: &[\n")
+    for name, val in sorted(types.items(), key=lambda kv: kv[1]):
+        w('        DescType::new(%d, "NVOS32_DESCRIPTOR_TYPE_%s"),\n' % (val, name))
+    w("    ],\n")
+    w("};\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--ogkm", required=True, help="open-gpu-kernel-modules checkout at the release tag")
+    ap.add_argument("--version", required=True)
+    ap.add_argument("--cc", default=os.environ.get("CC", "cc"))
+    a = ap.parse_args()
+
+    cls, function, types = constants(a.ogkm)
+
+    incs = []
+    for d in (SDK, "src/common/inc"):
+        incs += ["-I", os.path.join(a.ogkm, d)]
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "osdesc.c")
+        open(src, "w").write(PROBE)
+        exe = os.path.join(d, "osdesc")
+        r = subprocess.run([a.cc, "-w", *incs, src, "-o", exe], capture_output=True, text=True)
+        if r.returncode:
+            sys.stderr.write(r.stderr[-6000:])
+            sys.exit("the OS-descriptor probe did not compile")
+        out = subprocess.run([exe], capture_output=True, text=True, check=True).stdout
+
+    v = {}
+    for ln in out.split("\n"):
+        f = ln.split()
+        if f:
+            v[f[0]] = int(f[1])
+
+    # The address has to be inside the block it belongs to, or the backend
+    # would read past what the guest sent.
+    for route, size in (
+        ("alloc", "alloc_params_size"),
+        ("alloc_memory", "alloc_memory_size"),
+        ("vid_heap", "vid_heap_size"),
+    ):
+        at = v[f"{route}_address_at"] if route != "alloc_memory" else v["alloc_memory_address_at"]
+        if at + 8 > v[size]:
+            sys.exit(f"{route}: the address at {at} does not fit in {v[size]} bytes")
+
+    buf = io.StringIO()
+    emit(v, cls, function, types, a.version, buf)
+    text = buf.getvalue()
+    fmt = shutil.which("rustfmt")
+    if fmt:
+        r = subprocess.run([fmt, "--edition", "2024"], input=text, capture_output=True, text=True)
+        if r.returncode == 0:
+            text = r.stdout
+    sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()

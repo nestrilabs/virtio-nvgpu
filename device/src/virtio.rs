@@ -136,11 +136,22 @@ pub struct FdTranslation {
     pub payload_offset: u32,
 }
 
+/// This backend reads a deep block that holds several segments, one per
+/// pointer inside an RM control's parameters, announced by
+/// `deep_ptr_offset == protocol::segments::SEGMENTED`.
+///
+/// A guest that sends one to a backend without this bit has every described
+/// control refused: a v0.1 backend reads the marker as a real offset and finds
+/// it outside the parameter block. So the guest sends segments only when it
+/// sees this.
+pub const FEATURE_RMCTRL_SEGMENTS: u32 = 1 << 0;
+
 /// Device configuration space.
 ///
-/// Mirrors `struct virtio_gpu_nv_config`, which the driver asserts is 4016
-/// bytes with `num_fd_translations` at offset 3880, and which must fit in one
-/// page.
+/// Mirrors `struct virtio_gpu_nv_config` up to 4016 bytes, which the driver
+/// asserts, with `num_fd_translations` at offset 3880. The guest reads no
+/// further: `vram_limit_mib` after it is for the VMM. The whole must fit in
+/// one page.
 ///
 /// This replaced a 24-byte struct whose first field was `num_gpus`. The driver
 /// reads `num_gpus` from offset 32 and rejects zero, so it read past the end of
@@ -154,14 +165,30 @@ pub struct VirtioGpuNvConfig {
     pub driver_version: [u8; DRIVER_VERSION_LEN],
     /// How many entries of `gpus` are valid. The driver requires 1..=248.
     pub num_gpus: u32,
-    /// Capability bits.
+    /// What the guest is served, as `crate::caps` bits. Never zero from this
+    /// backend: zero is what a backend from before capabilities sends, and a
+    /// guest driver treats it as "everything, as before".
     pub caps: u32,
     /// PCI device id per GPU.
     pub gpu_device_ids: [u32; MAX_GPUS],
     pub gpus: [GpuSlot; MAX_GPUS],
     pub num_fd_translations: u32,
-    pub _pad: u32,
+    /// What this backend can do beyond v0.1, as [`FEATURE_RMCTRL_SEGMENTS`]
+    /// and the like. This was padding; a backend from before it sent zero,
+    /// which reads as "none of these", so the guest needs no version to read
+    /// it and the struct's layout does not change.
+    pub features: u32,
     pub fd_translations: [FdTranslation; MAX_FD_TRANSLATIONS],
+    /// The video memory limit this backend enforces, in MiB; 0 for none.
+    ///
+    /// Announced so the VMM can refuse to start a guest whose backend is not
+    /// enforcing the limit the VMM was configured with: a limit is a flag on
+    /// a process the VMM did not start, and a missing flag would otherwise be
+    /// a guest with the whole card. Appended, so a backend from before it
+    /// serves 4016 bytes and a VMM reads the absence as 0. The guest driver
+    /// never reads it: a VMM from before it exposes 4016 bytes, and a guest
+    /// read past those BUGs in virtio_cread_bytes.
+    pub vram_limit_mib: u64,
 }
 
 impl Default for VirtioGpuNvConfig {
@@ -173,8 +200,9 @@ impl Default for VirtioGpuNvConfig {
             gpu_device_ids: [0; MAX_GPUS],
             gpus: [GpuSlot::default(); MAX_GPUS],
             num_fd_translations: 0,
-            _pad: 0,
+            features: 0,
             fd_translations: [FdTranslation::default(); MAX_FD_TRANSLATIONS],
+            vram_limit_mib: 0,
         }
     }
 }
@@ -185,8 +213,16 @@ impl VirtioGpuNvConfig {
     /// More than [`MAX_GPUS`] are truncated: the driver reads no further, so
     /// advertising a count it cannot index would point it at slots that were
     /// never written.
-    pub fn new(driver_version: &str, gpus: &[GpuSlot]) -> Self {
+    pub fn new(
+        driver_version: &str,
+        gpus: &[GpuSlot],
+        caps: crate::caps::Caps,
+        vram_limit_mib: u64,
+    ) -> Self {
         let mut cfg = Self::default();
+        cfg.caps = caps.bits();
+        cfg.vram_limit_mib = vram_limit_mib;
+        cfg.features = FEATURE_RMCTRL_SEGMENTS;
         let v = driver_version.as_bytes();
         let n = v.len().min(DRIVER_VERSION_LEN - 1);
         cfg.driver_version[..n].copy_from_slice(&v[..n]);
@@ -252,7 +288,9 @@ mod tests {
     #[test]
     fn layout_matches_the_guest_driver() {
         assert_eq!(size_of::<GpuSlot>(), 476, "gpu_slot size mismatch");
-        assert_eq!(size_of::<VirtioGpuNvConfig>(), 4016, "config size mismatch");
+        assert_eq!(size_of::<VirtioGpuNvConfig>(), 4024, "config size mismatch");
+        // Where the guest driver's struct ends; it reads nothing past here.
+        assert_eq!(offset_of!(VirtioGpuNvConfig, vram_limit_mib), 4016);
         assert_eq!(
             offset_of!(VirtioGpuNvConfig, num_fd_translations),
             3880,
@@ -298,10 +336,15 @@ mod tests {
     #[test]
     fn one_gpu_is_described_where_the_driver_looks() {
         let slot = GpuSlot::new("0000:01:00.0", 0, "Model: NVIDIA RTX A2000");
-        let cfg = VirtioGpuNvConfig::new("615.71.09", &[slot]);
+        let cfg = VirtioGpuNvConfig::new("615.71.09", &[slot], crate::caps::Caps::DEFAULT, 0);
         let bytes = cfg.as_bytes();
 
         assert_eq!(&bytes[0..9], b"615.71.09");
+        assert_eq!(
+            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            crate::caps::Caps::DEFAULT.bits(),
+            "caps at offset 36"
+        );
         assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 1);
         assert_eq!(&bytes[72..84], b"0000:01:00.0");
         // info_len, at slot offset 20 within the slot array at 72.
@@ -327,7 +370,7 @@ mod tests {
         let many: Vec<_> = (0..12)
             .map(|i| GpuSlot::new(&format!("0000:0{i}:00.0"), i, ""))
             .collect();
-        let cfg = VirtioGpuNvConfig::new("615.71.09", &many);
+        let cfg = VirtioGpuNvConfig::new("615.71.09", &many, crate::caps::Caps::DEFAULT, 0);
         let n = cfg.num_gpus;
         assert_eq!(
             n as usize, MAX_GPUS,
@@ -338,8 +381,8 @@ mod tests {
     #[test]
     fn a_read_past_the_end_is_clamped_rather_than_panicking() {
         let cfg = VirtioGpuNvConfig::default();
-        assert_eq!(cfg.read(4004, 64).len(), 12);
+        assert_eq!(cfg.read(4012, 64).len(), 12);
         assert!(cfg.read(99_999, 16).is_empty());
-        assert_eq!(cfg.read(0, 4016).len(), 4016);
+        assert_eq!(cfg.read(0, 4024).len(), 4024);
     }
 }

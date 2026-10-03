@@ -107,6 +107,57 @@ Four is what was run, not a limit. Each guest has 2 vCPUs on an 8-core host, so
 four is also where the host's CPUs are fully committed, and vkcube at 720p is a
 small load: four guests running a real game is a different measurement.
 
+### Twelve guests encoding at once
+
+RTX 3060, 595.104.02, 8-core host, guests of 1 vCPU and 1 GiB:
+
+| guests | frames each | dropped | VRAM (MiB) | encoder | GPU | host load |
+|---|---|---|---|---|---|---|
+| 1 | 2178 | 0 | 111 | 20% | 23% | 0 |
+| 2 | 2185, 2186 | 0 | 194 | 40% | 44% | 2 |
+| 4 | 2145 to 2149 | 0 | 359 | 54% | 47% | 3 |
+| 6 | 2121 to 2136 | 0 | 525 | 55% | 42% | 6 |
+| 8 | 2181 to 2194 | 0 | 690 | 57% | 41% | 9 |
+| 10 | 2164 to 2178 | 0 | 855 | 54% | 41% | 9 |
+| 12 | 1999 to 2153 | 0 | 1021 | 57% | 46% | 18 |
+
+RTX A2000, 615.71.09, 12-core host, guests of 2 vCPUs and 2 GiB:
+
+| guests | frames each | dropped | VRAM (MiB) | encoder | GPU | host load |
+|---|---|---|---|---|---|---|
+| 8 | 2072 to 2112 | 8 to 13 | 1051 | 69% | 40% | 10.7 |
+| 10 | 2050 to 2135 | 9 to 15 | 1314 | 68% | 40% | 17.7 |
+| 12 | 1991 to 2076 | 12 to 17 | 1576 | 69% | 40% | 19.0 |
+
+Each guest runs the encode probe for 40 s: a compositor, vkcube presenting
+into it, the capture layer encoding 720p60 H.264 with Vulkan Video, and a
+receiver. The host then decodes each guest's stream. Every stream at every
+step decoded with no error. Card and host sampled once a second, 2026-10-03,
+`rig.sh density` with `GUEST_ARGS=SECS=40`. [not reproduced]
+
+Frames each is streaming time at 60 Hz, so the spread at twelve guests is boot
+time on a host with more vCPUs than cores. The A2000's drops fall in each
+stream's first second. The encoder figure stays near 55 to 70% from six guests
+up while every stream keeps its rate, so it does not show headroom here.
+
+### Encode session cap
+
+| encodes at once | NVENC (`h264_nvenc`) | Vulkan Video (`h264_vulkan`) |
+|---|---|---|
+| 1 to 12 | all finish, driver counts N sessions | all finish, driver counts 0 |
+| 16 | 12 finish, 4 fail `OpenEncodeSessionEx failed: incompatible client key` | 16 finish, driver counts 0 |
+
+RTX 3060, 595.104.02, on the host with no guest. Real-time 720p60 ffmpeg
+encodes, `scripts/rig/host-encode-cap.sh`, 2026-10-03. [not reproduced]
+
+The capture layer encodes with Vulkan Video, which this driver does not count
+against the cap. A path that encodes through NVENC stops at 12 per card on
+this driver. The cap and what it counts are the driver's, so re-run the
+script on each driver release.
+
+vkcube takes 85 to 130 MiB of VRAM a guest. A game takes gigabytes, so with
+games VRAM sets the number of guests before the encoder does.
+
 ## The whole chain
 
 Not a synthetic load: a Wayland client presenting through a compositor in the
@@ -160,6 +211,38 @@ host directly, so none of these numbers is a cost of virtualisation — they are
 what one streamed game uses on this card. Frame rate and frame pacing were not
 recorded.
 
+## One RM control
+
+The cost of a single forwarded call, which is what device setup, allocation
+and every driver query pay. `rmbench` (`scripts/rig/guest/rmbench.c`) times
+100,000 calls of `NV0000_CTRL_CMD_SYSTEM_GET_FEATURES`, which RM answers
+without touching the GPU. The same static binary runs in the guest and on the
+host.
+
+| build | A2000 guest | A2000 host | 3060 guest | 3060 host |
+|---|---:|---:|---:|---:|
+| v0.1.1 code (`--caps` added) | 35.5 us | 3.57 us | 18.1 us | 2.5 us |
+| per-call logging off, guarded buffers reused | 19.2 us | | | |
+| and request and response buffers kept | 19.3 us | | 13.6 us | |
+| and one completion per request in the guest | 19.3 us | | 13.5 us | |
+
+Median of three runs of 100,000 calls. A2000: driver 615.71.09, Arch, Linux
+7.2 guest, 2 vCPUs, nesbox. 3060: driver 595.104.02, Ubuntu 26.04, same guest
+kernel. 2026-10-02.
+
+The same call from several threads, `rmbench-mt`, A2000, total calls over
+wall time:
+
+| threads | before the guest fix | after |
+|---:|---|---:|
+| 1 | 20.3 us | 20.7 us |
+| 4 | 20,006 of 80,000 calls failed | 9.1 us |
+| 8 | 100,008 of 160,000 calls failed | 7.1 us |
+
+Before the fix the guest driver shared one completion between every caller,
+so concurrent calls woke the wrong thread or timed out. See the driver's
+`nvgpu_send_recv`.
+
 ## Re-taking these
 
 The harnesses are in the private engineering notes rather than here, because
@@ -188,8 +271,9 @@ slower each run — and that is how a harness bug here cost a full set of number
 
 - **No comparison with another hypervisor.** None was run. "Faster than X" is
   not a claim this data can carry, and neither is "the fastest".
-- **Four guests, not "many".** Four ran; eight has not been tried, and neither
-  have four guests running a real game.
+- **Twelve guests of vkcube, not twelve games.** Twelve encoding guests ran on
+  each card; several guests running a real game has not been tried, and that
+  is where VRAM decides the number.
 - **No overhead figure for a real game.** `nesprobe` is synthetic. One game has
   been streamed, on the A2000, and what it uses is above — but it has no
   bare-metal run beside it.

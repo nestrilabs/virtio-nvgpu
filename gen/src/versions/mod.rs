@@ -55,9 +55,18 @@ struct Profile {
 
 /// Profiles in ascending version order.
 static PROFILES: &[Profile] = &[
-    Profile { version: DriverVersion::new(535, 129, 3), table: v535_129_03::table },
-    Profile { version: DriverVersion::new(580, 178, 4), table: v580_178_04::table },
-    Profile { version: DriverVersion::new(595, 71, 5), table: v595_71_05::table },
+    Profile {
+        version: DriverVersion::new(535, 129, 3),
+        table: v535_129_03::table,
+    },
+    Profile {
+        version: DriverVersion::new(580, 178, 4),
+        table: v580_178_04::table,
+    },
+    Profile {
+        version: DriverVersion::new(595, 71, 5),
+        table: v595_71_05::table,
+    },
 ];
 
 /// Select the profile for `v`.

@@ -13,7 +13,11 @@ moves faster than prose can follow.
 > guest renders, presents and encodes H.264, and costs within 2% of bare metal
 > ([`BENCHMARKS.md`](BENCHMARKS.md)).
 >
-> **Designed but not built:** the isolate, CUDA beyond enumeration, several
+> **Built, as of 2026-10-03:** CUDA, opt-in. A guest makes a context and moves
+> device memory both ways; see §5 for the one mapping that needed a second
+> region.
+>
+> **Designed but not built:** the isolate, unified memory, several
 > guests on one card, MIG and SR-IOV. Each is called out where it appears.
 
 ---
@@ -173,6 +177,30 @@ And anything that fails to give space back fails *later*, in whatever mapping
 happens to be next, which is why the accounting is explicit rather than
 implicit.
 
+### The UVM aperture
+
+A CUDA semaphore pool cannot go in the window. Creating a CUDA context makes a
+UVM semaphore pool at an address the caller chose, then maps the UVM file
+there at an offset equal to that address. UVM takes the mapping only at the
+host address equal to the offset, only for the pool's own range, and by
+default only from the process that initialised the file. The window's host
+address is wherever the VMM reserved it, and the VMM is not that process.
+
+Each pool gets a memory slot of its own. The backend initialises every UVM file in
+multi-process sharing mode, which lifts the one-process rule. On a guest's
+mmap of a UVM file it checks the pool, picks a 2 MiB-aligned offset in a
+second shared-memory region, the UVM aperture (id 2, 1 GiB), and hands
+the VMM the file with the same placement request the window uses. The VMM
+checks the request again, maps the file at the pool's own address without
+replacing anything of its own, faults the pages in, and gives that range a
+memory slot inside the aperture. The guest maps its vma from there,
+write-back, because a pool is ordinary host kernel memory.
+
+A pool is taken out in the opposite order, the slot first and then the
+mapping, so the guest never has a slot over nothing. A pool goes when the guest unmaps
+it, when its file closes, and when the device resets. One slot per pool costs
+a memory-slot update on a running VM, once per CUDA context.
+
 ---
 
 ## 6. How a buffer becomes shareable
@@ -262,8 +290,9 @@ an error.
 
 The CUDA route — importing a rendered image into CUDA, encoding it with NVENC
 from a GPU pointer — is the one the project was originally designed around, and
-the ioctls it needs are forwarded. It is untested beyond enumeration, and it is
-a second path rather than a fallback.
+the ioctls it needs are forwarded. The CUDA driver now runs in a guest, but
+this route through it has not been tried, and it is a second path rather than
+a fallback.
 
 What is deliberately out of scope is unified memory: `cudaMallocManaged` and
 page-fault-driven migration need fault handling across the VM boundary and

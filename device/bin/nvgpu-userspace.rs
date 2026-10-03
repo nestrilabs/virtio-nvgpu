@@ -34,12 +34,9 @@ struct Args {
     #[arg(long)]
     stage: Option<PathBuf>,
 
-    /// Which capabilities to carry: utility, compute, graphics, video.
-    #[arg(
-        long,
-        value_delimiter = ',',
-        default_value = "utility,compute,graphics,video"
-    )]
+    /// Which capabilities to carry: utility, compute, graphics, video. The
+    /// default is the backend's: compute is staged only when named.
+    #[arg(long, value_delimiter = ',', default_value = "graphics,video,utility")]
     caps: Vec<String>,
 
     /// List every file, not just the totals.
@@ -51,11 +48,6 @@ struct Args {
     /// talking to. An explicit value pins the share and is recorded in it.
     #[arg(long)]
     driver_version: Option<String>,
-
-    /// Stage the manifest's own build even when a different module is loaded.
-    /// Kept for deliberately reproducing a mismatch; see decision 0070.
-    #[arg(long)]
-    allow_version_mismatch: bool,
 }
 
 fn capability(name: &str) -> Result<Capability> {
@@ -159,13 +151,11 @@ fn main() -> Result<()> {
         .or_else(|| manifest_version.clone());
 
     let mut found = found;
-    let mut missing = missing;
-    let mut retargeted_from = None;
 
     if let (Some(m), Some(t)) = (&manifest_version, &target) {
-        if m != t && !args.allow_version_mismatch {
+        if m != t {
             let swapped = retarget(&entries, m, t);
-            let (f2, m2) = resolve(&swapped, &caps, &search);
+            let (f2, _) = resolve(&swapped, &caps, &search);
             // Only accept the swap if that build is really installed. A
             // target with nothing on disk must fail loudly below, not quietly
             // produce a share with three files in it.
@@ -176,9 +166,7 @@ fn main() -> Result<()> {
                     f2.len(),
                     found.len()
                 );
-                retargeted_from = Some(m.clone());
                 found = f2;
-                missing = m2;
             }
         }
     }
@@ -201,16 +189,15 @@ fn main() -> Result<()> {
     // forwarded ioctl returns 0, and the caller gives up deep inside a library
     // that is a different build from the kernel module it is talking to.
     if let (Some(staged), Some(loaded)) = (&staged_version, &loaded_version) {
-        if staged != loaded && !args.allow_version_mismatch {
+        if staged != loaded {
             anyhow::bail!(
                 "refusing to stage driver {staged} while kernel module {loaded} is loaded.\n\n\
                  The manifest at {} describes {staged}, and retargeting onto {loaded} did not \n\
                  find enough of it installed -- so {loaded}'s userspace is not on this host, \n\
                  or not where this looks for it.\n\n\
                  Install the userspace matching the loaded module, or pass \n\
-                 --driver-version to name a build that is present. \n\
-                 --allow-version-mismatch stages the manifest's own build anyway; see \n\
-                 decision 0070 for why that is not the default.",
+                 --driver-version to name a build that is present. A guest's libraries \n\
+                 must be the build of the module they talk to.",
                 args.manifest.display()
             );
         }

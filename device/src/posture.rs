@@ -64,26 +64,20 @@ pub fn refusal(euid: u32, caps: Caps) -> Option<String> {
 }
 
 /// Check the process may serve a guest, then drop every capability it has and
-/// set no_new_privs. `allow_root` lets a root or CAP_SYS_ADMIN process go on,
-/// with a warning: guest processes are then RM administrators.
-pub fn enforce(allow_root: bool) -> anyhow::Result<()> {
+/// set no_new_privs. There is no override: a root backend makes every guest
+/// process an RM administrator, and a test rig can run it as a plain user as
+/// easily as anything else can.
+pub fn enforce() -> anyhow::Result<()> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     let caps = Caps::current()?;
     if let Some(why) = refusal(euid, caps) {
-        if !allow_root {
-            anyhow::bail!(
-                "refusing to start: {why}. The host driver takes a guest's privilege from the \
-                 backend's, so every guest process would be an RM administrator. Run the \
-                 backend as an unprivileged user that can open /dev/nvidia* and the GPU's \
-                 render node, or pass --allow-root-unsafe for a test rig"
-            );
-        }
-        log::warn!(
-            "--allow-root-unsafe: serving although {why}; every guest process is an RM \
-             administrator. Never run a guest you do not trust like this"
+        anyhow::bail!(
+            "refusing to start: {why}. The host driver takes a guest's privilege from the \
+             backend's, so every guest process would be an RM administrator. Run the \
+             backend as an unprivileged user that can open /dev/nvidia* and the GPU's \
+             render node"
         );
-        return Ok(());
     }
     drop_all()?;
     let after = Caps::current()?;
