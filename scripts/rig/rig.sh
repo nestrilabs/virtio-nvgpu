@@ -156,7 +156,10 @@ do_nesbox() {
     fi
     log "nesbox from $src on $host"
     for i in $(seq 1 "$RIG_TRIES"); do
-        rsync -az --delete --exclude target/ --exclude .git/ --exclude '*.svg' --exclude 'perf.data*' \
+        # Tracked files only: a checkout collects untracked images and
+        # recordings (8.4 GB of them once), and the workstation's link is the
+        # slow one.
+        git -C "$src" ls-files -z | rsync -az --from0 --files-from=- \
             -e "${SSH[*]}" "$src/" "$host:${dir#\$HOME/}/" && break
         [ "$i" = "$RIG_TRIES" ] && return 255
         sleep 5
