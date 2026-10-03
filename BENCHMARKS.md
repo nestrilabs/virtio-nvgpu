@@ -107,6 +107,62 @@ Four is what was run, not a limit. Each guest has 2 vCPUs on an 8-core host, so
 four is also where the host's CPUs are fully committed, and vkcube at 720p is a
 small load: four guests running a real game is a different measurement.
 
+### Twelve guests encoding at once (2026-10-03)
+
+Each guest runs the encode probe — a compositor, vkcube presenting into it,
+the capture layer encoding 720p60 H.264 with Vulkan Video, a receiver — for a
+40 s window. Afterwards the host pulls every guest's stream out of its image
+and decodes it: every frame, no error, and a picture that is not one flat
+level. Card and host are sampled once a second. `rig.sh density`
+(`scripts/rig/box-density.sh`).
+
+RTX 3060, 595.104.02, 8 cores; guests of 1 vCPU and 1 GiB:
+
+| guests | frames each | dropped | VRAM | encoder | GPU | host load |
+|---|---|---|---|---|---|---|
+| 1 | 2178 | 0 | 111 MiB | 20% | 23% | 0 |
+| 2 | 2185, 2186 | 0 | 194 MiB | 40% | 44% | 2 |
+| 4 | 2145–2149 | 0 | 359 MiB | 54% | 47% | 3 |
+| 6 | 2121–2136 | 0 | 525 MiB | 55% | 42% | 6 |
+| 8 | 2181–2194 | 0 | 690 MiB | 57% | 41% | 9 |
+| 10 | 2164–2178 | 0 | 855 MiB | 54% | 41% | 9 |
+| 12 | 1999–2153 | 0 | 1021 MiB | 57% | 46% | 18 |
+
+RTX A2000, 615.71.09, 12 cores; guests of 2 vCPUs and 2 GiB:
+
+| guests | frames each | dropped | VRAM | encoder | GPU | host load |
+|---|---|---|---|---|---|---|
+| 8 | 2072–2112 | 8–13 | 1051 MiB | 69% | 40% | 10.7 |
+| 10 | 2050–2135 | 9–15 | 1314 MiB | 68% | 40% | 17.7 |
+| 12 | 1991–2076 | 12–17 | 1576 MiB | 69% | 40% | 19.0 |
+
+**Every stream of every guest decoded, at every step, on both cards.** A
+guest's frame count is its streaming time at 60 Hz; the spread at twelve is
+how much later some guests finished booting on a host with more vCPUs than
+cores. The A2000's drops all fall in each stream's first second.
+
+**What ran out first was the host, not the card.** At twelve guests the 3060
+host is at load 18 on 8 cores. The encoder figure flattens near 55–70% on
+both cards from about six guests while every stream keeps its full rate, so
+it is not a measure of headroom here; frames delivered is.
+
+**There is a session cap, and the guests' path does not meet it.**
+`scripts/rig/host-encode-cap.sh` runs N real-time 720p60 encodes on the host
+itself, through each API. On the 3060 at 595.104.02:
+
+| encodes at once | NVENC (`h264_nvenc`) | Vulkan Video (`h264_vulkan`) |
+|---|---|---|
+| 1–12 | all finish; the driver counts N sessions | all finish; the driver counts 0 |
+| 16 | 12 finish; the rest fail `OpenEncodeSessionEx failed: incompatible client key` | 16 finish; the driver counts 0 |
+
+The capture layer encodes with Vulkan Video, so twelve guests never touched
+the cap. Anything that encodes through NVENC — a CUDA-to-NVENC path — meets it
+at 12 per card on this driver. Both the cap and what it counts belong to the
+driver: re-run the script on every driver version before relying on either.
+
+vkcube is a small load: 85–130 MiB of VRAM a guest. A real game takes
+gigabytes, so with games VRAM, not the encoder, decides how many fit.
+
 ## The whole chain
 
 Not a synthetic load: a Wayland client presenting through a compositor in the
@@ -220,8 +276,9 @@ slower each run — and that is how a harness bug here cost a full set of number
 
 - **No comparison with another hypervisor.** None was run. "Faster than X" is
   not a claim this data can carry, and neither is "the fastest".
-- **Four guests, not "many".** Four ran; eight has not been tried, and neither
-  have four guests running a real game.
+- **Twelve guests of vkcube, not twelve games.** Twelve encoding guests ran on
+  each card; several guests running a real game has not been tried, and that
+  is where VRAM decides the number.
 - **No overhead figure for a real game.** `nesprobe` is synthetic. One game has
   been streamed, on the A2000, and what it uses is above — but it has no
   bare-metal run beside it.
