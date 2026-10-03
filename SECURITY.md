@@ -42,6 +42,8 @@ These hold on this branch.
 | UVM tools | `nvidia-uvm-tools`, under every capability |
 | the backend's own reach | every path but the GPU nodes, the driver's `/proc` and `/sys` trees and the socket's directory; every executable mapping; every new process; every socket but AF_UNIX; every system call outside the allowlist. A kernel without Landlock or without seccomp filtering is refused at start |
 | UVM init | the guest's UVM_INITIALIZE flags; the backend sends its own, with HMM off and sharing mode on, and pageable access off where the release has the flag |
+| UVM pools | a mapping of a UVM file that is not page-aligned, is over 64 MiB, names a host address outside [4 GiB, 32 TiB), overlaps a live pool, or would pass 64 pools or 256 MiB per VM. Checked by the backend, then again by the VMM, which maps without replacing any mapping of its own |
+| UVM descriptors | a descriptor in a UVM call that is not one of this guest's files of the kind that call needs, or an `hClient` beside it that RM did not issue on that same control file; `-1`, UVM's own "none", passes |
 | embedded pointers | a guest address in a pointer RM dereferences inside an RM control's parameters: the backend supplies every such buffer itself, sized from the count in the guest's own block and bounded at 1 MiB per pointer and 2 MiB per call |
 | allocation rights | `NVOS64.pRightsRequested`, a pointer RM dereferences when it is not null; the host sees null and the caller gets its own value back |
 | release drift | on a host with no pointer table of its own, every control any release describes a pointer in that the selected table does not; the backend does not start when no table covers the release at all |
@@ -87,12 +89,8 @@ These are open on this branch. Until they land, treat a guest as able to reach
 the backend process itself, and treat the backend as able to reach everything
 its user can.
 
-- An RM allowlist. RM controls and classes inside a capability are forwarded
-  without a per-release list of what is safe to expose.
 - UVM size tables. UVM ioctls are not yet checked against per-release sizes,
   which is one reason compute is opt-in.
-- Memory registered by CPU address. Allocations that name guest memory by
-  address are not yet translated.
 - Per-process isolation inside one guest. One backend serves every process
   in a guest. The design for one helper per guest process is in `isolate/`
   and is not built.

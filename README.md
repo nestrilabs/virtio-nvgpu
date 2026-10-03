@@ -119,8 +119,12 @@ memory — and for mutually untrusted tenants that or vGPU is still the answer.
 - **one of two game launches on the A2000 lost its capture**: the swapchain
   refused `TRANSFER_SRC`, so nothing was encoded, and a relaunch worked. The
   error code was not recorded and the cause is not known.
-- CUDA is forwarded but untested beyond enumeration; the jailer, per-version
-  driver shares and the multi-tenant envelope are unbuilt.
+- **CUDA runs on one box, not yet measured.** On the A2000 / 615.71.09 a
+  guest makes a context, allocates device memory and copies 1 MiB there and
+  back unchanged. It needs `--caps ...,compute` and a VMM that offers the UVM
+  aperture. Unified memory (`cudaMallocManaged`) has not been tried.
+- The jailer, per-version driver shares and the multi-tenant envelope are
+  unbuilt.
 
 ---
 
