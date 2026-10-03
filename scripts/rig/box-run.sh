@@ -81,6 +81,10 @@ if ! [ -S "$SOCK" ]; then
     exit 1
 fi
 
+# A stream left by an earlier run would pass the decode check below.
+[ "$PROBE" = guest-probe-encode.sh ] &&
+    /usr/sbin/debugfs -w -R "rm /capture.h264" "$GPU_ROOTFS" >/dev/null 2>&1 || true
+
 # shellcheck disable=SC2086
 timeout "${GPU_TIMEOUT:-180}" $GPU_VMM "$GPU_LOGS/$RUN_TAG.json" \
     > "$GPU_LOGS/$RUN_TAG.console.log" 2>&1 || true
@@ -93,4 +97,27 @@ grep -aE 'PASS|FAIL|frames=|deviceName|offscreen-draw|nvidia-smi:|rmbench|cuda|C
     "$GPU_LOGS/$RUN_TAG.console.log" | sed 's/^/  /' | head -n 30 || true
 grep -aE 'refus|served [0-9]+ message|panicked|error' "$GPU_LOGS/$RUN_TAG.backend.log" |
     sed -E 's/^\[[^]]*\] ?//; s/^/  backend: /' | head -n 20 || true
+# The encode probe's receiver only counts what arrived, and a black or
+# corrupt stream arrives at full rate. So the stream comes out of the image
+# and is decoded here: every frame, no decode error, and a picture that is
+# not one flat level.
+if [ "$PROBE" = guest-probe-encode.sh ] && command -v ffprobe >/dev/null; then
+    out="$GPU_LOGS/$RUN_TAG.h264"
+    /usr/sbin/debugfs -R "dump /capture.h264 $out" "$GPU_ROOTFS" >/dev/null 2>&1 || true
+    n=$(ffprobe -v error -count_frames -select_streams v:0 \
+        -show_entries stream=nb_read_frames -of csv=p=0 "$out" 2>/dev/null || echo 0)
+    if [ "${n:-0}" -gt 0 ] && ffmpeg -v error -xerror -i "$out" -f null - 2>/dev/null; then
+        echo "  HOST: PASS   stream decodes  $n frame(s), no error"
+    else
+        echo "  HOST: FAIL   stream decodes  ${n:-0} frame(s) read from $out"
+    fi
+    range=$(ffmpeg -i "$out" -vf "select=eq(n\,$((${n:-2} / 2))),signalstats,metadata=print" \
+        -f null - 2>&1 | grep -aoE 'YMIN=[0-9]+|YMAX=[0-9]+' | cut -d= -f2 | tr '\n' ' ')
+    read -r ymin ymax <<<"$range"
+    if [ -n "${ymax:-}" ] && [ $((ymax - ymin)) -gt 32 ]; then
+        echo "  HOST: PASS   picture is not flat  Y $ymin..$ymax in frame $((${n:-2} / 2))"
+    else
+        echo "  HOST: FAIL   picture is not flat  Y ${ymin:-?}..${ymax:-?}"
+    fi
+fi
 echo "  logs: $GPU_LOGS/$RUN_TAG.{backend,console}.log"
