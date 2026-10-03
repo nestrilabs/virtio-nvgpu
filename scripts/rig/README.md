@@ -43,6 +43,7 @@ staged beside them in `/opt/nvgpu`.
 | `guest-probe-vulkan.sh` | `nvidia-smi` and `vulkaninfo` name the card |
 | `guest-probe-encode.sh` | a compositor, a Vulkan client presenting into it, the capture layer encoding H.264 on the GPU and a receiver (`nesrecv.c`) counting it: about 600 frames in the run, and the two `HOST:` lines PASS. `box-run.sh` pulls the stream out of the image and decodes it on the host, because a black or corrupt stream still arrives at full rate |
 | `rig-probe-cuda.sh` | 10 of 10, ending in a 1 MiB round trip with 0 bytes different |
+| `rig-probe-vramlimit.sh` | with `BACKEND_ARGS="... --vram-limit-mib N"` and `GUEST_ARGS="VRAM_LIMIT_MIB=N"`: `nvidia-smi`, the Vulkan heap and CUDA report N; CUDA and Vulkan allocation each stop at N with an out-of-memory error, every line PASS. Without a limit, both run to the card's size |
 | `rig-probe-uvm.sh` | 7 of 7 UVM calls |
 | `rig-probe-osdesc.sh` | memory registered by CPU address, read back |
 | `rig-probe-caps.sh` | via `rig.sh caps`: each capability set shows exactly the nodes it should |

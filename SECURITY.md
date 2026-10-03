@@ -42,6 +42,7 @@ These hold on this branch.
 | UVM tools | `nvidia-uvm-tools`, under every capability |
 | the backend's own reach | every path but the GPU nodes, the driver's `/proc` and `/sys` trees and the socket's directory; every executable mapping; every new process; every socket but AF_UNIX; every system call outside the allowlist. A kernel without Landlock or without seccomp filtering is refused at start |
 | UVM init | the guest's UVM_INITIALIZE flags; the backend sends its own, with HMM off and sharing mode on, and pageable access off where the release has the flag |
+| video memory | with `--vram-limit-mib`, an allocation of video memory past the limit, on both routes RM takes it by (`RM_ALLOC` of `NV01_MEMORY_LOCAL_USER`, and `VID_HEAP_CONTROL`): answered `NV_ERR_NO_MEMORY` without reaching the host. Every figure that tells the guest how much video memory there is, or is free, is brought down to the limit. A limit on a driver release with no video-memory table of its own is refused at start |
 | UVM pools | a mapping of a UVM file that is not page-aligned, is over 64 MiB, names a host address outside [4 GiB, 32 TiB), overlaps a live pool, or would pass 64 pools or 256 MiB per VM. Checked by the backend, then again by the VMM, which maps without replacing any mapping of its own |
 | UVM descriptors | a descriptor in a UVM call that is not one of this guest's files of the kind that call needs, or an `hClient` beside it that RM did not issue on that same control file; `-1`, UVM's own "none", passes |
 | embedded pointers | a guest address in a pointer RM dereferences inside an RM control's parameters: the backend supplies every such buffer itself, sized from the count in the guest's own block and bounded at 1 MiB per pointer and 2 MiB per call |
@@ -91,9 +92,14 @@ its user can.
 
 - UVM size tables. UVM ioctls are not yet checked against per-release sizes,
   which is one reason compute is opt-in.
+- Memory RM allocates inside other objects. Channel and context buffers are
+  made by RM on the guest's behalf and never appear as a sized allocation,
+  so the video-memory limit does not count them: about 34 MiB for one
+  encoding guest on an A2000. A guest can exceed its limit by that much.
 - Per-process isolation inside one guest. One backend serves every process
-  in a guest. The design for one helper per guest process is in `isolate/`
-  and is not built.
+  in a guest. The design for one helper per guest process is in `isolate/`;
+  it is parked, not planned: the boundaries that matter are guest to host
+  and VM to VM, and each VM already has its own backend.
 
 ## Compared with gVisor's nvproxy
 
