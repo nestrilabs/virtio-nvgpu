@@ -39,6 +39,7 @@ These hold on this branch.
 | release | a host driver older than every profile; the backend does not start |
 | privilege | running as root or with CAP_SYS_ADMIN; the backend does not start, and drops every capability and sets no_new_privs before it opens a device |
 | capabilities | device nodes and RM classes outside `--caps`: `nvidia-uvm` without compute, `nvidia-modeset` and render nodes without graphics, 3D classes without graphics, NVENC, NVDEC, NVJPG and OFA classes without video |
+| UVM calls | a UVM call the host release does not define, or one at any size but that release's own |
 | UVM tools | `nvidia-uvm-tools`, under every capability |
 | the backend's own reach | every path but the GPU nodes, the driver's `/proc` and `/sys` trees and the socket's directory; every executable mapping; every new process; every socket but AF_UNIX; every system call outside the allowlist. A kernel without Landlock or without seccomp filtering is refused at start |
 | UVM init | the guest's UVM_INITIALIZE flags; the backend sends its own, with HMM off and sharing mode on, and pageable access off where the release has the flag |
