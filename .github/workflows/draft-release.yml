@@ -46,7 +46,9 @@ jobs:
           # git name.
           since=''
           if [ -n "$last" ]; then
-            since="&since=$(git log -1 --format=%cI "$last")"
+            # In UTC with a Z: a "+03:00" offset's "+" arrives as a space,
+            # GitHub matches no commits, and every author falls back to a name.
+            since="&since=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd "$last")"
           fi
           gh api "repos/$REPO/commits?sha=$GITHUB_SHA&per_page=100$since" --paginate \
             --jq '.[] | "\(.sha)\t\(.author.login // "")"' > "$RUNNER_TEMP/logins"
