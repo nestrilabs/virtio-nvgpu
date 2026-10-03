@@ -107,6 +107,7 @@ impl Status {
 }
 
 /// A DRM render node the host owns, as the guest is told about it.
+#[derive(Clone)]
 struct DriDevice {
     name: String,
     major: u32,
@@ -268,6 +269,9 @@ pub struct NvidiaBackend {
     /// mapped more than once -- the guest maps it, exports it, an importer maps
     /// it again -- and each placement costs a slice of a finite window.
     dri_maps: std::collections::HashMap<(u64, u64), u32>,
+    /// The render nodes the guest was told of, by the index it opens them by.
+    /// `None` until GET_SYS_FILES has answered.
+    dri_given: std::cell::RefCell<Option<Vec<DriDevice>>>,
     /// UVM semaphore pools placed in the aperture. See `aperture.rs`.
     aperture: aperture::Aperture,
     /// Every message this backend has served, by kind.
@@ -359,6 +363,7 @@ impl NvidiaBackend {
             window: None,
             dri_maps: std::collections::HashMap::new(),
             aperture: Default::default(),
+            dri_given: Default::default(),
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             guards: Default::default(),

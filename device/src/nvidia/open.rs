@@ -39,7 +39,9 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::ENODEV);
         }
 
-        let path = match device_path_with(req.device_type, &self.dri_devices()) {
+        let given = self.dri_given.borrow().clone();
+        let dri = given.unwrap_or_else(|| self.dri_devices());
+        let path = match device_path_with(req.device_type, &dri) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("handle_open: {}", e);

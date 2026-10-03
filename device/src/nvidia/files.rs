@@ -430,6 +430,10 @@ impl NvidiaBackend {
         } else {
             Vec::new()
         };
+        // Kept: the guest numbers nodes by this list, so an open must be
+        // resolved against it and not against a fresh scan of sysfs, which
+        // came back empty under ten guests' load and refused the open.
+        *self.dri_given.borrow_mut() = Some(devices.clone());
         log::info!("GET_SYS_FILES: {} DRI device(s)", devices.len());
 
         if buf.len() < 4 {
