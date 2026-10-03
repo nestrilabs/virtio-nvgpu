@@ -24,6 +24,9 @@
 #   BACKEND_WRAP     a command the backend runs under, e.g.
 #                    "strace -f -c -o /tmp/backend.strace"
 #   GPU_TIMEOUT      seconds before the guest is killed (default 180)
+#   GPU_VCPUS, GPU_MEM_MIB
+#                    the guest's size (default 2 and 2048); smaller lets a
+#                    density run reach the card's limits before the host's
 #
 # Prints the guest's result lines and the backend's refusals, and leaves
 # $GPU_LOGS/<tag>.{backend,console}.log and <tag>.json.
@@ -60,7 +63,7 @@ cat > "$GPU_LOGS/$RUN_TAG.json" <<JSON
   "drives": [
     { "drive_id": "rootfs", "path_on_host": "$GPU_ROOTFS", "is_root_device": true, "is_read_only": false }
   ],
-  "machine-config": { "vcpu_count": 2, "mem_size_mib": 2048 },
+  "machine-config": { "vcpu_count": ${GPU_VCPUS:-2}, "mem_size_mib": ${GPU_MEM_MIB:-2048} },
   "gpu-forward": { "socket": "$SOCK" },
   "shared-directories": [
     { "tag": "nvidia", "path-on-host": "$GPU_SHARE", "read-only": true }

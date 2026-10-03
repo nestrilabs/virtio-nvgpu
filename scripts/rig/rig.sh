@@ -83,7 +83,7 @@ $2"; }
 gpu_env() {
     local v out=""
     for v in GPU_DIR GPU_BIN GPU_ROOT GPU_USER GPU_ROOTFS GPU_ROOTFS_BASE \
-             GPU_KERNEL GPU_VMM GPU_SHARE GPU_LOGS GPU_TIMEOUT TAG; do
+             GPU_KERNEL GPU_VMM GPU_SHARE GPU_LOGS GPU_TIMEOUT GPU_VCPUS GPU_MEM_MIB TAG; do
         [ -n "${!v:-}" ] && out+="$v=$(printf %q "${!v}") "
     done
     printf '%s' "$out"
