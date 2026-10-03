@@ -20,7 +20,7 @@ If your tenants don't trust each other, use VFIO passthrough or NVIDIA vGPU.
   the virtio devices its VMM offers.
 - **Each VM gets its own backend**, which refuses to run as root. Before it
   opens the GPU it drops its capabilities and locks itself down with seccomp
-  and Landlock. It can't run programs, open other files, or use any other socket but
+  and Landlock. It can't run programs, open other files, or use any socket other than
   AF_UNIX.
 
 ## What the backend refuses
