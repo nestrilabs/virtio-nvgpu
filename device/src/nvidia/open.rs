@@ -102,6 +102,12 @@ impl NvidiaBackend {
             }
         }
 
+        // A pool outlives the file only as long as the VMM's mapping does, and
+        // that mapping holds the file open on the host.
+        if self.handle_kinds.get(&handle) == Some(&DeviceKind::Uvm) {
+            self.drop_pools_for_file(handle);
+        }
+
         // RM frees every client made on a control file when it closes.
         if self.handle_kinds.get(&handle) == Some(&DeviceKind::Ctl) {
             self.vram.file_closed(handle);

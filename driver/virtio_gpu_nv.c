@@ -393,6 +393,8 @@ struct nvgpu_device;
 
 /* The shared memory region device memory is placed in, id 1. */
 #define NVGPU_SHM_ID 1
+/* The UVM aperture: one slot per CUDA semaphore pool, see nvgpu_mmap(). */
+#define NVGPU_SHM_ID_APERTURE 2
 
 /*
  * Which capability bits GET_DEV_INFO claims. Parameters rather than constants
@@ -567,6 +569,7 @@ struct nvgpu_device {
    * memory can be mapped on the host but never reached from here.
    */
   struct virtio_shm_region window;
+  struct virtio_shm_region aperture;
   struct virtio_device *vdev;
   struct virtqueue *ctrl_vq;
   struct virtqueue *event_vq;
@@ -3025,6 +3028,34 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   }
 
   vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+
+  /*
+   * A UVM file maps one thing: a semaphore pool, at the address equal to its
+   * offset. The host takes it only there, so it is not in the window but in
+   * the aperture, where the VMM gave the pool a slot of its own. It is the
+   * host kernel's ordinary memory, so it is mapped write-back.
+   */
+  if (nfd->device_type == NVGPU_DEV_UVM) {
+    window_off = le64_to_cpu(resp->guest_phys_addr);
+    if (!nfd->dev->aperture.len || window_off + size > nfd->dev->aperture.len) {
+      dev_warn(&nfd->dev->vdev->dev,
+               "virtio-gpu-nv: UVM pool at %llu+%llu is outside the %llu-byte "
+               "aperture\n",
+               window_off, size, nfd->dev->aperture.len);
+      ret = -ERANGE;
+      goto out;
+    }
+    ret = remap_pfn_range(vma, vma->vm_start,
+                          (nfd->dev->aperture.addr + window_off) >> PAGE_SHIFT,
+                          size, vma->vm_page_prot);
+    if (ret)
+      goto out;
+    vma->vm_ops = &nvgpu_vm_ops;
+    vma->vm_private_data =
+        (void *)(unsigned long)le32_to_cpu(resp->mapping_id);
+    goto out;
+  }
+
   vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 
   /*
@@ -5716,6 +5747,13 @@ static int nvgpu_probe(struct virtio_device *vdev) {
              "virtio-gpu-nv: no shared memory region; device memory will not "
              "be mappable\n");
   }
+
+  /* Absent on a VMM without one; then CUDA cannot make a context. */
+  if (virtio_get_shm_region(vdev, &dev->aperture, NVGPU_SHM_ID_APERTURE))
+    dev_info(&vdev->dev, "virtio-gpu-nv: UVM aperture at %pa, %llu bytes\n",
+             &dev->aperture.addr, dev->aperture.len);
+  else
+    dev->aperture.len = 0;
 
   /* Fetch host sysfs content + DRI device list from the VMM */
   ret = nvgpu_fetch_sys_files(dev);

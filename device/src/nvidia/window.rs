@@ -24,6 +24,12 @@ impl NvidiaBackend {
         // allocates -- so the second object's mmap would find the first one's
         // entry and hand back the first one's memory. The objects are told
         // apart by the offset, and that is what the path below keys on.
+        // A UVM file maps one thing, a semaphore pool, and only at the address
+        // equal to its offset -- which the window cannot give it.
+        if self.handle_kinds.get(&(self.current_handle as u64)) == Some(&DeviceKind::Uvm) {
+            return self.map_uvm_pool(req.size, req.offset, resp_buf);
+        }
+
         if matches!(
             self.handle_kinds.get(&(self.current_handle as u64)),
             Some(DeviceKind::Dri(_))
@@ -223,6 +229,11 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL);
         }
         let req = read_struct::<MunmapReq>(payload, 0);
+
+        if let Some(pool) = self.aperture.remove(req.mapping_id) {
+            self.unmap_uvm_pool(req.mapping_id, pool);
+            return self.write_hdr(resp_buf, 0, 0);
+        }
 
         // Zero is what every mapping the RM path hands out carries: those are
         // taken back by RM_UNMAP_MEMORY, which names them by the address in

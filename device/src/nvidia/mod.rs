@@ -268,6 +268,8 @@ pub struct NvidiaBackend {
     /// mapped more than once -- the guest maps it, exports it, an importer maps
     /// it again -- and each placement costs a slice of a finite window.
     dri_maps: std::collections::HashMap<(u64, u64), u32>,
+    /// UVM semaphore pools placed in the aperture. See `aperture.rs`.
+    aperture: aperture::Aperture,
     /// Every message this backend has served, by kind.
     ///
     /// Kept because "how often does the guest have to ask the host anything"
@@ -356,6 +358,7 @@ impl NvidiaBackend {
         Self {
             window: None,
             dri_maps: std::collections::HashMap::new(),
+            aperture: Default::default(),
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             guards: Default::default(),
@@ -594,6 +597,9 @@ impl NvidiaBackend {
     // ------------------------------------------------------------------
 
     pub fn teardown(&mut self) {
+        for (id, pool) in self.aperture.take_all() {
+            self.unmap_uvm_pool(id, pool);
+        }
         log::info!(
             "NvidiaBackend::teardown: draining {} handles, {} active maps",
             self.handles.len(),
@@ -812,6 +818,7 @@ fn write_struct<T: Copy>(buf: &mut [u8], val: &T) -> usize {
     sz
 }
 
+mod aperture;
 mod files;
 pub use files::FileTree;
 mod host;

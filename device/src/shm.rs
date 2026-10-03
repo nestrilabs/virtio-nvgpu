@@ -630,4 +630,18 @@ pub trait WindowPlacer: Send {
     /// Return a range to empty. Not an unmap: leaving a hole would let a later
     /// access reach no mapping at all in a range the memory slot still covers.
     fn withdraw(&self, shm_offset: u64, len: u64) -> Result<()>;
+
+    /// Have the VMM map `len` bytes of a UVM file at host address `addr`,
+    /// which is also the file offset, and back `offset` within the aperture
+    /// with it. See `nvidia/aperture.rs`. A transport with no aperture says so.
+    fn place_pool(&self, offset: u64, len: u64, fd: RawFd, addr: u64) -> Result<()> {
+        let _ = (offset, len, fd, addr);
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
+    }
+
+    /// Take a pool back out: the slot first, then the VMM's mapping.
+    fn withdraw_pool(&self, offset: u64, len: u64) -> Result<()> {
+        let _ = (offset, len);
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
+    }
 }

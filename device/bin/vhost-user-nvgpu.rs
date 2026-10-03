@@ -155,6 +155,40 @@ impl WindowPlacer for VhostWindow {
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
     }
+
+    fn place_pool(&self, offset: u64, len: u64, fd: RawFd, addr: u64) -> device::error::Result<()> {
+        // On the aperture, fd_offset is the pool's host address as well as
+        // its offset in the file: UVM takes the mapping nowhere else.
+        let req = VhostUserMMap {
+            shmid: NV_SHM_ID_APERTURE,
+            padding: [0; 7],
+            fd_offset: addr,
+            shm_offset: offset,
+            len,
+            flags: VhostUserMMapFlags::WRITABLE.bits(),
+        };
+        // SAFETY: as in `place`.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        self.0
+            .shmem_map(&req, &borrowed)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
+
+    fn withdraw_pool(&self, offset: u64, len: u64) -> device::error::Result<()> {
+        let req = VhostUserMMap {
+            shmid: NV_SHM_ID_APERTURE,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset: offset,
+            len,
+            flags: 0,
+        };
+        self.0
+            .shmem_unmap(&req)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
 }
 
 /// What the event thread is told to start and stop watching.
@@ -331,6 +365,8 @@ const EVENT_QUEUE: usize = 1;
 /// The shared-memory id the guest driver looks the window up by, which must
 /// match the capability the VMM publishes.
 const NV_SHM_ID: u8 = 1;
+/// The UVM aperture, where semaphore pools are placed. See `device/src/nvidia/aperture.rs`.
+const NV_SHM_ID_APERTURE: u8 = 2;
 
 struct NvGpuBackend {
     nvidia: Arc<Mutex<NvidiaBackend>>,
