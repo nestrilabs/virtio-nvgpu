@@ -120,10 +120,6 @@ impl Aperture {
     pub fn take_all(&mut self) -> Vec<(u32, Pool)> {
         std::mem::take(&mut self.pools).into_iter().collect()
     }
-
-    pub fn len(&self) -> usize {
-        self.pools.len()
-    }
 }
 
 impl NvidiaBackend {
@@ -266,6 +262,6 @@ mod tests {
         let gone = ap.take_for_handle(1);
         assert_eq!(gone.len(), 1);
         assert_eq!(gone[0].0, 1);
-        assert_eq!(ap.len(), 1);
+        assert_eq!(ap.take_all().len(), 1);
     }
 }

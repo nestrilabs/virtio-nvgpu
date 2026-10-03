@@ -100,7 +100,7 @@ kill $BE 2>/dev/null || true
 wait $BE 2>/dev/null || true
 
 echo "== $PROBE ($RUN_TAG) on $(uname -n), stamp $(cat "$(dirname "$0")/.stamp" 2>/dev/null || echo ?)"
-grep -aE 'PASS|FAIL|frames=|deviceName|offscreen-draw|nvidia-smi:|rmbench|cuda|CUDA|panic|Oops' \
+grep -aE 'PASS|FAIL|INFO   |vulkan heap|frames=|deviceName|offscreen-draw|nvidia-smi:|rmbench|cuda|CUDA|panic|Oops' \
     "$GPU_LOGS/$RUN_TAG.console.log" | sed 's/^/  /' | head -n 30 || true
 grep -aE 'refus|served [0-9]+ message|panicked|error' "$GPU_LOGS/$RUN_TAG.backend.log" |
     sed -E 's/^\[[^]]*\] ?//; s/^/  backend: /' | head -n 20 || true

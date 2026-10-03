@@ -28,6 +28,8 @@ const DEEP_BUF_FLOOR: usize = 64 * 1024;
 
 /// `NVOS64_PARAMETERS.status`, where RM writes its answer to an allocation.
 const NVOS64_STATUS: usize = 40;
+/// RM_ALLOC classes that make a client rather than an object in one.
+const ROOT_CLASSES: [u32; 3] = [0x0, 0x1, 0x41];
 
 const NVOS54_CMD: usize = 8;
 const NVOS54_PARAMS_SIZE: usize = 24;
@@ -223,6 +225,12 @@ pub struct NvidiaBackend {
     /// is known, and until then those routes are not recognised -- which is
     /// why nothing is served before a release is known at all.
     osdesc: Option<abi::osdesc::OsDesc>,
+    /// Where an allocation's size is and what tells the guest how much video
+    /// memory there is, for this release. See `vidmem.rs`.
+    vidmem: Option<abi::vidmem::Selected>,
+    /// NVOS32 FREE calls seen. Not charged back, because the table has no
+    /// layout for them; reported so a workload that uses them is noticed.
+    vidmem_untracked_frees: u64,
     /// Guest RAM, as something to map from. `None` until the transport
     /// supplies it, and without it a registration by address has nowhere to
     /// find the guest's pages and is refused.
@@ -374,6 +382,8 @@ impl NvidiaBackend {
             rmallow: None,
             uvm: None,
             osdesc: None,
+            vidmem: None,
+            vidmem_untracked_frees: 0,
             guest_ram: None,
             registrations: std::collections::HashMap::new(),
             registrations_served: 0,
@@ -430,8 +440,21 @@ impl NvidiaBackend {
     }
 
     /// Set the guest's video-memory budget. `None` is no limit.
-    pub fn set_vram_limit_mib(&mut self, mib: Option<u64>) {
+    ///
+    /// Refused with a limit on a release that has no video-memory table of its
+    /// own: the limit could not be enforced, and a backend that announces a
+    /// limit it is not holding the guest to is worse than one with none.
+    pub fn set_vram_limit_mib(&mut self, mib: Option<u64>) -> std::result::Result<(), String> {
+        if mib.is_some() && !self.vidmem.is_some_and(|s| s.exact) {
+            return Err(match self.driver {
+                Some(v) => format!(
+                    "--vram-limit-mib: host driver {v} has no video-memory table of its own"
+                ),
+                None => "--vram-limit-mib: the host driver release is not known yet".to_string(),
+            });
+        }
         self.vram = crate::vram::Vram::new(mib);
+        Ok(())
     }
 
     /// The budget this backend enforces, in MiB; 0 when there is none.
@@ -497,6 +520,7 @@ impl NvidiaBackend {
             return Err(format!("host driver {v} has no OS-descriptor table"));
         };
         self.osdesc = Some(osdesc);
+        self.vidmem = abi::vidmem::select(v);
         log::info!(
             "host driver {v}: {} RM controls carry a pointer RM dereferences",
             sel.table.len()
@@ -602,6 +626,22 @@ impl NvidiaBackend {
     // ------------------------------------------------------------------
 
     pub fn teardown(&mut self) {
+        log::info!(
+            "NvidiaBackend::teardown: video memory {} MiB in use, peak {} MiB, {} allocation(s) refused, limit {}",
+            self.vram.in_use() >> 20,
+            self.vram.peak() >> 20,
+            self.vram.refused(),
+            match self.vram.limit() {
+                Some(l) => format!("{} MiB", l >> 20),
+                None => "none".to_string(),
+            }
+        );
+        if self.vidmem_untracked_frees > 0 {
+            log::warn!(
+                "NvidiaBackend::teardown: {} VID_HEAP_CONTROL FREE call(s) not charged back",
+                self.vidmem_untracked_frees
+            );
+        }
         for (id, pool) in self.aperture.take_all() {
             self.unmap_uvm_pool(id, pool);
         }
@@ -837,6 +877,7 @@ mod rm_fd;
 mod rmctrl;
 mod simple;
 mod uvm;
+mod vidmem;
 mod window;
 
 #[cfg(test)]

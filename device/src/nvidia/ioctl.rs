@@ -4,7 +4,6 @@ use super::*;
 
 /// `NV01_ROOT`, `NV01_ROOT_NON_PRIV` and `NV01_ROOT_CLIENT`: the classes
 /// whose allocation makes a client.
-const ROOT_CLASSES: [u32; 3] = [0x0, 0x1, 0x41];
 
 impl NvidiaBackend {
     // ------------------------------------------------------------------
@@ -39,6 +38,7 @@ impl NvidiaBackend {
         self.rmallow = abi::rmallow::select(v);
         self.uvm = abi::uvm::select(v);
         self.osdesc = abi::osdesc::select(v);
+        self.vidmem = abi::vidmem::select(v);
         match self.abi {
             Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
             None => log::warn!(
@@ -244,7 +244,11 @@ impl NvidiaBackend {
         payload: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
+        if let Some(n) = self.vidmem_admit(cookie, payload, resp_buf) {
+            return n;
+        }
         let n = self.serve_ioctl(cookie, payload, resp_buf);
+        self.vidmem_note(payload, &mut resp_buf[..n]);
         self.note_clients(payload, &resp_buf[..n]);
         self.note_registrations(payload, &resp_buf[..n]);
         n

@@ -410,7 +410,9 @@ impl NvGpuBackend {
             .set_host_driver_version(release)
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
         nvidia.set_caps(caps);
-        nvidia.set_vram_limit_mib(vram_limit_mib);
+        nvidia
+            .set_vram_limit_mib(vram_limit_mib)
+            .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
 
         let nvidia_vram_mib = nvidia.vram_limit_mib();
         Ok(Self {

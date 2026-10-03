@@ -2597,4 +2597,139 @@ mod tests {
         assert_ne!(parse_resp(&resp).status, 0);
         assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
     }
+
+    // ==================================================================
+    // Video memory
+    // ==================================================================
+
+    const VID_HEAP: u64 = 0xc0b8_464a; // _IOWR('F', 0x4a, NVOS32), 184 bytes
+
+    /// An NVOS32 ALLOC_SIZE of `mib` MiB of video memory as `h_memory` under
+    /// `parent`, on 615.71.09's layout.
+    fn vid_alloc(client: u32, parent: u32, h_memory: u32, mib: u64) -> Vec<u8> {
+        let l = &abi::vidmem::v615_71_09::LAYOUT;
+        let a = l.nvos32_alloc_size;
+        let mut p = vec![0u8; l.nvos32_size as usize];
+        let put = |p: &mut Vec<u8>, at: u32, v: &[u8]| {
+            p[at as usize..at as usize + v.len()].copy_from_slice(v)
+        };
+        put(&mut p, 0, &client.to_le_bytes());
+        put(&mut p, 4, &parent.to_le_bytes());
+        put(
+            &mut p,
+            l.nvos32_function,
+            &l.nvos32_fn_alloc_size.to_le_bytes(),
+        );
+        put(&mut p, a.h_memory, &h_memory.to_le_bytes());
+        // attr 0: located in video memory on this release.
+        put(&mut p, a.size, &(mib << 20).to_le_bytes());
+        p
+    }
+
+    fn vid_status(be: &mut NvidiaBackend, h: u64, params: &[u8]) -> u32 {
+        let mut v = hdr(MsgType::Ioctl, h);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: VID_HEAP as u32,
+                data_len: params.len() as u32,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(params);
+        let mut resp = vec![0u8; 64 * 1024];
+        be.dispatch(&v, &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl itself succeeds");
+        let at = IOCTL_BODY + abi::vidmem::v615_71_09::LAYOUT.nvos32_status as usize;
+        u32::from_le_bytes(resp[at..at + 4].try_into().unwrap())
+    }
+
+    fn free(be: &mut NvidiaBackend, h: u64, client: u32, parent: u32, handle: u32) {
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&client.to_le_bytes());
+        p[4..8].copy_from_slice(&parent.to_le_bytes());
+        p[8..12].copy_from_slice(&handle.to_le_bytes());
+        assert_eq!(rm_on(be, h, RM_FREE, &p), 0);
+    }
+
+    /// The limit is held on the route Vulkan uses: an allocation past it is
+    /// answered NV_ERR_NO_MEMORY without reaching the host, and a free gives
+    /// the room back.
+    #[test]
+    fn video_memory_past_the_limit_is_refused_and_a_free_returns_it() {
+        let host = UvmHost::default();
+        let (mut be, _, ctl) = uvm_backend(&host, v615());
+        be.set_vram_limit_mib(Some(100)).unwrap();
+        rm_client(&mut be, ctl, CLIENT);
+
+        assert_eq!(
+            vid_status(&mut be, ctl, &vid_alloc(CLIENT, CLIENT, 0x10, 60)),
+            0
+        );
+        let heard = host.calls().len();
+        assert_eq!(
+            vid_status(&mut be, ctl, &vid_alloc(CLIENT, CLIENT, 0x11, 60)),
+            0x51
+        );
+        assert_eq!(
+            host.calls().len(),
+            heard,
+            "a refused allocation never reaches the host"
+        );
+        assert_eq!(be.vram.in_use(), 60 << 20);
+
+        free(&mut be, ctl, CLIENT, CLIENT, 0x10);
+        assert_eq!(be.vram.in_use(), 0);
+        assert_eq!(
+            vid_status(&mut be, ctl, &vid_alloc(CLIENT, CLIENT, 0x11, 60)),
+            0
+        );
+    }
+
+    /// Freeing the object an allocation was made under frees the allocation,
+    /// as RM does.
+    #[test]
+    fn freeing_a_parent_releases_the_video_memory_under_it() {
+        let host = UvmHost::default();
+        let (mut be, _, ctl) = uvm_backend(&host, v615());
+        be.set_vram_limit_mib(Some(100)).unwrap();
+        rm_client(&mut be, ctl, CLIENT);
+        // A device under the client, and memory under the device.
+        let mut dev = [0u8; 48];
+        dev[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+        dev[4..8].copy_from_slice(&CLIENT.to_le_bytes());
+        dev[8..12].copy_from_slice(&0x20u32.to_le_bytes());
+        dev[12..16].copy_from_slice(&0x80u32.to_le_bytes());
+        rm_on(&mut be, ctl, RM_ALLOC, &dev);
+        assert_eq!(
+            vid_status(&mut be, ctl, &vid_alloc(CLIENT, 0x20, 0x30, 80)),
+            0
+        );
+        assert_eq!(be.vram.in_use(), 80 << 20);
+        free(&mut be, ctl, CLIENT, CLIENT, 0x20);
+        assert_eq!(be.vram.in_use(), 0);
+    }
+
+    /// Without its own release's table the limit could not be held, and the
+    /// backend says so instead of announcing it.
+    #[test]
+    fn a_limit_without_this_releases_table_is_refused() {
+        let mut be = NvidiaBackend::for_test();
+        assert!(
+            be.set_vram_limit_mib(Some(100)).is_err(),
+            "no release known"
+        );
+        be.set_host_driver_version(abi::version::DriverVersion::new(600, 0, 0))
+            .unwrap();
+        assert!(
+            be.set_vram_limit_mib(Some(100)).is_err(),
+            "a neighbour's table"
+        );
+        assert!(be.set_vram_limit_mib(None).is_ok());
+        be.set_host_driver_version(v615()).unwrap();
+        assert!(be.set_vram_limit_mib(Some(100)).is_ok());
+    }
 }
