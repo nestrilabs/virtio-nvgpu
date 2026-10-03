@@ -18,8 +18,8 @@ insmod /opt/nvgpu/virtio_gpu_nv.ko
 # carry its own copy: the forwarded ioctls are a private contract between one
 # build of these libraries and one build of the host kernel module.
 mkdir -p /mnt/nvidia && mount -t virtiofs nvidia /mnt/nvidia 2>/dev/null
-export LD_LIBRARY_PATH=/mnt/nvidia/lib
-export VK_DRIVER_FILES=/mnt/nvidia/share/vulkan/icd.d/nvidia_icd.json
+. /opt/nvgpu/guest-nvidia-env.sh
+nvgpu_env_check || echo "GUEST: continuing anyway so the failure is visible"
 
 echo "GUEST: ---- nvidia-smi ----"
 /mnt/nvidia/bin/nvidia-smi 2>&1 | head -12
