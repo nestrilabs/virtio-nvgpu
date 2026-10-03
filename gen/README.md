@@ -1,73 +1,52 @@
-# `gen/` — generated ABI tables
+# gen
 
-Checked in **and** reproducible. Both properties matter: a contributor must be
-able to read the tables without running anything, and regenerate them without
-asking anyone.
+Tables of NVIDIA's kernel ABI, one per driver release, and the scripts that
+make them. The tables are checked in, so they can be read without running
+anything, and every one can be regenerated from public sources.
 
-NVIDIA's kernel driver ABI is not stable — ioctl struct layouts change between
-releases. The tables here map driver versions to struct layouts and to the set
-of commands that exist and are safe to forward.
+NVIDIA's kernel interface changes between releases. Struct sizes, field
+offsets, command numbers and index values move. The backend selects the table
+for the host's release at start. A release with no profile of its own gets the
+nearest older one, and where an older table would be wrong rather than
+incomplete, the backend refuses instead.
 
-Two halves, with different risk:
+## Generators
 
-- **The struct half is derived mechanically** from NVIDIA's published
-  `open-gpu-kernel-modules` at each tag, by compiling a probe per field and
-  reading back `sizeof`/`offsetof`. Nothing is transcribed by hand.
-- **The judgement half** — which commands exist, and which are safe to expose —
-  follows gVisor's `nvproxy` upstream.
+| script | reads | writes | what the backend does with it |
+|---|---|---|---|
+| `nvabi_gen.py` | gVisor's nvproxy | `src/versions/` | escape sizes, the ABI check on every forwarded ioctl |
+| `rmctrl_extract.py` | open-gpu-kernel-modules | `src/rmctrl/`, `../driver/rmctrl/` | RM controls whose parameters hold pointers |
+| `rmallow_extract.py` | open-gpu-kernel-modules | `src/rmallow/` | the RM controls and classes a guest may use |
+| `uvm_extract.py` | open-gpu-kernel-modules | `src/uvm/` | UVM commands, their sizes and descriptor fields |
+| `osdesc_extract.py` | open-gpu-kernel-modules | `src/osdesc/` | the calls that name memory by CPU address |
+| `vidmem_extract.py` | open-gpu-kernel-modules | `src/vidmem/` | video memory allocations and the figures that report memory, for `--vram-limit-mib` |
+| `nvgpu_gen.py` | open-gpu-kernel-modules | `../driver/gen/` | RM allocation sizes and V1 to V2 rewrites, for the guest module |
 
-Profiles key off **ranges, not points**: a driver release between two known
-versions selects the lower profile rather than requiring a new row. This is why
-the per-release cost is small rather than open-ended.
-
-The generator must stay runnable by someone who does not work on this project.
-
----
-
-## The generator
-
-Two scripts, no build system, no Go toolchain. gVisor is a Bazel project and
-`go build` on it fails without generated code, so these read its sources
-directly rather than linking against it.
+The `*_extract.py` scripts compile a small C probe against the release's own
+headers and print what it reports. Nothing is transcribed by hand. Where a
+script has to classify something, a release that adds an unclassified entry
+stops the script, so a person reads it first.
 
 ```sh
-# one profile, from a gVisor checkout
-./nvabi_gen.py --gvisor ~/forks/gvisor --version 580.178.04 \
-    > src/versions/v580_178_04.rs
-
-# just a struct size, when checking one thing by hand
-./nvabi_sizes.py --gvisor ~/forks/gvisor NVOS46_PARAMETERS_V580
+./vidmem_extract.py --ogkm ~/forks/ogkm-615.71.09 --version 615.71.09 \
+    > src/vidmem/v615_71_09.rs
 ```
 
-`nvabi_sizes.py` computes `sizeof` from the Go declarations in
-`pkg/abi/nvgpu`. Those structs are `structs.HostLayout` — deliberately laid out
-like the C structs they mirror — so applying natural alignment reproduces the
-driver ABI.
+`--ogkm` is an open-gpu-kernel-modules checkout at the release's tag. The
+scripts need Python 3 and a C compiler. `nvabi_gen.py` reads a gVisor checkout
+instead, with no Go toolchain.
 
-`nvabi_gen.py` resolves the version chain. nvproxy records each driver release
-as a delta against its parent, so the ABI for one version is the base map plus
-every override along its lineage; the generated file names the chain it walked.
+## Adding a release
 
-Adding a driver version is one command plus a line in `src/versions/mod.rs`.
-If gVisor does not know the version, the generator says so and stops rather
-than guessing.
+1. Check out open-gpu-kernel-modules at the release tag.
+2. Run each generator for it, and add the new file to that table's `mod.rs`.
+3. Run `cargo test -p abi`. The tests check every table for internal
+   consistency and against the releases around it.
+4. Run the rig's probe set on a host with that release before shipping it.
 
 ## Fixtures
 
-`fixtures/*.tsv` holds ioctl parameter sizes **observed on real hardware**,
-captured with `nvidia_sniffer` under `LD_PRELOAD`.
-
-The tables come from nvproxy. The fixtures come from a running GPU. They are
-independent, and `src/fixtures.rs` asserts they agree — which is the only place
-a wrong table is caught before it reaches a guest, where the symptom is a
-silently truncated ioctl rather than an error.
-
-`fixtures/580.178.04.tsv` was captured on a Tesla T4 (Turing) from
-`nvidia-smi`, `vulkaninfo`, a CUDA driver-API probe and an `h264_nvenc` encode.
-It found one real defect on arrival: the hand-written table had
-`NV_ESC_RM_MAP_MEMORY_DMA` at 48 bytes, where 580 uses `NVOS46_PARAMETERS_V580`
-at 64.
-
-A fixture is only evidence for the driver version and architecture that
-produced it. RM class IDs are per-architecture, so a Turing capture says
-nothing about Ampere's channel classes.
+`fixtures/*.tsv` holds ioctl parameter sizes captured on real hardware with
+`nvidia_sniffer`. `src/fixtures.rs` checks the tables against them. A fixture
+is evidence only for the release and GPU architecture that produced it.
+`580.178.04.tsv` came from a Tesla T4.

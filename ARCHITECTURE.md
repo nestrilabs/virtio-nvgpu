@@ -179,28 +179,27 @@ implicit.
 
 ### The UVM aperture
 
-One mapping cannot go in the window at all. Creating a CUDA context makes a
+A CUDA semaphore pool cannot go in the window. Creating a CUDA context makes a
 UVM semaphore pool at an address the caller chose, then maps the UVM file
 there at an offset equal to that address. UVM takes the mapping only at the
 host address equal to the offset, only for the pool's own range, and by
-default only from the process that initialised the file. The window is none
-of those: its host address is wherever the VMM reserved it.
+default only from the process that initialised the file. The window's host
+address is wherever the VMM reserved it, and the VMM is not that process.
 
-So each pool gets a slot of its own. The backend initialises every UVM file in
+Each pool gets a memory slot of its own. The backend initialises every UVM file in
 multi-process sharing mode, which lifts the one-process rule. On a guest's
 mmap of a UVM file it checks the pool, picks a 2 MiB-aligned offset in a
-second shared-memory region, the **UVM aperture** (id 2, 1 GiB), and hands
+second shared-memory region, the UVM aperture (id 2, 1 GiB), and hands
 the VMM the file with the same placement request the window uses. The VMM
 checks the request again, maps the file at the pool's own address without
 replacing anything of its own, faults the pages in, and gives that range a
 memory slot inside the aperture. The guest maps its vma from there,
 write-back, because a pool is ordinary host kernel memory.
 
-Taking a pool out goes the other way round: the slot first, then the mapping,
-so the guest never has a slot over nothing. A pool goes when the guest unmaps
+A pool is taken out in the opposite order, the slot first and then the
+mapping, so the guest never has a slot over nothing. A pool goes when the guest unmaps
 it, when its file closes, and when the device resets. One slot per pool costs
-a memory-slot update on a running VM, once per CUDA context, which is the
-price of an address that is fixed per pool.
+a memory-slot update on a running VM, once per CUDA context.
 
 ---
 
