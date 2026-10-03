@@ -82,8 +82,12 @@ if ! [ -S "$SOCK" ]; then
 fi
 
 # A stream left by an earlier run would pass the decode check below.
-[ "$PROBE" = guest-probe-encode.sh ] &&
+# The guest powers off without unmounting, which leaves the bitmaps stale,
+# and debugfs will not write an image in that state: check it first.
+if [ "$PROBE" = guest-probe-encode.sh ]; then
+    /usr/sbin/e2fsck -fy "$GPU_ROOTFS" >/dev/null 2>&1 || true
     /usr/sbin/debugfs -w -R "rm /capture.h264" "$GPU_ROOTFS" >/dev/null 2>&1 || true
+fi
 
 # shellcheck disable=SC2086
 timeout "${GPU_TIMEOUT:-180}" $GPU_VMM "$GPU_LOGS/$RUN_TAG.json" \
@@ -103,9 +107,13 @@ grep -aE 'refus|served [0-9]+ message|panicked|error' "$GPU_LOGS/$RUN_TAG.backen
 # not one flat level.
 if [ "$PROBE" = guest-probe-encode.sh ] && command -v ffprobe >/dev/null; then
     out="$GPU_LOGS/$RUN_TAG.h264"
-    /usr/sbin/debugfs -R "dump /capture.h264 $out" "$GPU_ROOTFS" >/dev/null 2>&1 || true
+    rm -f "$out"
+    # -c: read-only and past the stale bitmaps the guest's poweroff leaves.
+    /usr/sbin/debugfs -c -R "dump /capture.h264 $out" "$GPU_ROOTFS" >/dev/null 2>&1 || true
     n=$(ffprobe -v error -count_frames -select_streams v:0 \
-        -show_entries stream=nb_read_frames -of csv=p=0 "$out" 2>/dev/null || echo 0)
+        -show_entries stream=nb_read_frames -of csv=p=0 "$out" 2>/dev/null || true)
+    # ffprobe says N/A for a file with no stream in it.
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
     if [ "${n:-0}" -gt 0 ] && ffmpeg -v error -xerror -i "$out" -f null - 2>/dev/null; then
         echo "  HOST: PASS   stream decodes  $n frame(s), no error"
     else
@@ -113,7 +121,8 @@ if [ "$PROBE" = guest-probe-encode.sh ] && command -v ffprobe >/dev/null; then
     fi
     range=$(ffmpeg -i "$out" -vf "select=eq(n\,$((${n:-2} / 2))),signalstats,metadata=print" \
         -f null - 2>&1 | grep -aoE 'YMIN=[0-9]+|YMAX=[0-9]+' | cut -d= -f2 | tr '\n' ' ')
-    read -r ymin ymax <<<"$range"
+    ymin= ymax=
+    read -r ymin ymax <<<"$range" || true
     if [ -n "${ymax:-}" ] && [ $((ymax - ymin)) -gt 32 ]; then
         echo "  HOST: PASS   picture is not flat  Y $ymin..$ymax in frame $((${n:-2} / 2))"
     else

@@ -18,6 +18,9 @@
 #   rig.sh caps [SET...]     boot rig-probe-caps.sh once per capability set
 #                            (default: the four sets below), each checked
 #                            against the nodes the guest should have
+#   rig.sh density P N...    N guests at once running probe P, for each N:
+#                            frames, decode, and the card's peak VRAM,
+#                            encoder load and sessions (box-density.sh)
 #   rig.sh hostbench         rmbench on the GPU host itself, as the backend's
 #                            user, for the bare-metal side of the ratio
 #   rig.sh all P [P...]      sync, build, module, stage, probe
@@ -281,6 +284,29 @@ do_probe() {
     return $rc
 }
 
+do_density() {
+    # Detached and polled, as do_probe is: a step of eight guests outlives
+    # an ssh connection easily.
+    local p=${1:?density: name a probe, then guest counts} sum out i
+    shift
+    [ $# -gt 0 ] || { log "density: give at least one guest count"; exit 2; }
+    sum="${GPU_LOGS:?}/$TAG-density.summary"
+    log "density $p x $* on $GPU_HOST"
+    remote "$GPU_HOST" "
+        mkdir -p '$GPU_LOGS'; rm -f '$sum'
+        $(gpu_env) BACKEND_ARGS=$(printf %q "${BACKEND_ARGS:-}") GUEST_ARGS=$(printf %q "${GUEST_ARGS:-}") \
+            setsid nohup bash -c 'bash $GPU_DIR/scripts/rig/box-density.sh $p $*; echo \"rig-done rc=\$?\"' \
+            > '$sum' 2>&1 < /dev/null &
+    "
+    for i in $(seq 1 720); do
+        sleep 10
+        out=$(remote "$GPU_HOST" "grep -q '^rig-done' '$sum' 2>/dev/null && cat '$sum'" 2>/dev/null) && break
+        out=""
+    done
+    [ -n "$out" ] || { log "density: no result after 2 hours; see $GPU_HOST:$sum"; exit 1; }
+    printf '%s\n' "$out" | grep -v '^rig-done'
+}
+
 do_caps() {
     local sets=("$@") set rc=0
     [ ${#sets[@]} -gt 0 ] || sets=(graphics,video,utility graphics,compute,video,utility compute video)
@@ -315,6 +341,7 @@ module) do_module ;;
 stage) do_stage ;;
 probe) do_probe "$@" ;;
 caps) do_caps "$@" ;;
+density) do_density "$@" ;;
 hostbench) do_hostbench ;;
 all) do_sync; do_build; do_module; do_stage; do_probe "$@" ;;
 *) sed -n '2,12p' "$0" >&2; exit 2 ;;
