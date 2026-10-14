@@ -16,12 +16,13 @@
 //! Guest memory must be shared (`memory-backend-memfd,share=on`) or the backend
 //! cannot read the request the guest wrote.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 use clap::Parser;
 use device::caps::Caps;
@@ -197,6 +198,33 @@ enum Watch {
     Remove(u32),
 }
 
+struct EventControl {
+    tx: Option<Sender<Watch>>,
+    wake: Arc<EventFd>,
+}
+
+impl EventControl {
+    fn send(&self, update: Watch) {
+        if self.tx.as_ref().unwrap().send(update).is_ok() {
+            self.notify();
+        }
+    }
+
+    fn notify(&self) {
+        if let Err(e) = self.wake.write(1) {
+            log::error!("event pump: wake: {e}");
+        }
+    }
+}
+
+impl Drop for EventControl {
+    fn drop(&mut self) {
+        // Disconnect before waking, so the pump cannot miss shutdown.
+        self.tx.take();
+        self.notify();
+    }
+}
+
 /// One `EventReady` message: a bare header naming the descriptor.
 fn event_ready_bytes(handle: u32) -> Vec<u8> {
     let hdr = MsgHeader::ok(MsgType::EventReady, handle);
@@ -209,15 +237,22 @@ fn event_ready_bytes(handle: u32) -> Vec<u8> {
 ///
 /// Returns false when the guest has posted none, which is the normal state of
 /// a guest whose driver predates this queue having a use -- and a reason to
-/// drop the notification rather than to fail.
+/// retain the notification for a later queue kick rather than to fail.
 fn push_event(vring: &VringRwLock, mem: &GuestMemoryAtomic<GuestMemoryMmap>, handle: u32) -> bool {
     let guard = mem.memory();
     let mut vr = vring.get_mut();
-    let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
-        return false;
-    };
-    let Some(chain) = avail.next() else {
-        return false;
+    let chain = loop {
+        let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
+            return false;
+        };
+        if let Some(chain) = avail.next() {
+            break chain;
+        }
+        drop(avail);
+        // Arm EVENT_IDX and recheck a buffer posted while arming.
+        if !vr.enable_notification().unwrap_or(false) {
+            return false;
+        }
     };
     let head = chain.head_index();
     drop(vr);
@@ -251,17 +286,16 @@ fn push_event(vring: &VringRwLock, mem: &GuestMemoryAtomic<GuestMemoryMmap>, han
 /// report and the driver spins -- measured at a whole core per guest at 100
 /// frames a second.
 ///
-/// A descriptor is dropped from the set after it is reported and put back a
-/// millisecond later. Level-triggered polling would otherwise spin here
-/// instead: the descriptor stays readable until the *guest* consumes the
-/// event, which happens through an ioctl this thread never sees. Re-arming on
-/// a timer costs a duplicate notification at worst, and the guest answers one
-/// by waking, finding nothing, and waiting again.
-fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<GuestMemoryMmap>) {
-    // How often to re-check a descriptor that is still readable. See the
-    // sweep below; this is a safety net, not the notification path.
-    const SWEEP: Duration = Duration::from_millis(1);
-
+/// Edge-triggered polling avoids spinning on a descriptor that stays readable
+/// until the guest consumes its event. The guest consumes readiness on poll,
+/// so still-readable descriptors need paced retries. Quiet open descriptors
+/// sleep until an edge or a control/queue wake instead of polling every millisecond.
+fn event_pump(
+    rx: Receiver<Watch>,
+    wake: Arc<EventFd>,
+    vring: VringRwLock,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+) {
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
         log::error!(
@@ -273,7 +307,29 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
     let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
 
     let mut watched: HashMap<u64, OwnedFd> = HashMap::new();
-    let mut last_sweep = Instant::now();
+    let mut ready = HashSet::new();
+    let mut last_retry = Instant::now();
+    const RETRY: Duration = Duration::from_millis(1);
+    const CONTROL: u64 = u64::MAX;
+    let mut control_event = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: CONTROL,
+    };
+    if unsafe {
+        libc::epoll_ctl(
+            epfd.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            wake.as_raw_fd(),
+            &mut control_event,
+        )
+    } < 0
+    {
+        log::error!(
+            "event pump: control epoll_ctl: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
 
     // Edge-triggered. Level-triggered would report a descriptor as readable
     // until the *guest* consumes the event, which happens through an ioctl
@@ -301,6 +357,7 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                     }
                 }
                 Ok(Watch::Remove(handle)) => {
+                    ready.remove(&(handle as u64));
                     if let Some(fd) = watched.remove(&(handle as u64)) {
                         ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
                     }
@@ -310,23 +367,31 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
             }
         }
 
-        // The safety net: an edge can be missed if a descriptor was already
-        // readable when it was added, or if a notification found no buffer
-        // posted. Every 10 ms, ask the descriptors directly and re-notify the
-        // ones that still have something to say. A lost wake costs a tenth of
-        // a frame at 60 Hz rather than a hang.
-        if last_sweep.elapsed() >= SWEEP {
-            last_sweep = Instant::now();
-            for (&handle, fd) in watched.iter() {
-                let mut pfd = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLIN != 0 {
-                    push_event(&vring, &mem, handle as u32);
+        // A successful delivery is consumed by the guest's poll(), not by
+        // the host fd. Keep its paced retry until host readiness clears.
+        if last_retry.elapsed() >= RETRY {
+            last_retry = Instant::now();
+            ready.retain(|&handle| {
+                if let Some(fd) = watched.get(&handle) {
+                    let mut pfd = libc::pollfd {
+                        fd: fd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+                    // An interrupted probe must not lose the only readiness edge.
+                    if n < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        return true;
+                    }
+                    if n > 0 && pfd.revents & libc::POLLIN != 0 {
+                        push_event(&vring, &mem, handle as u32);
+                        return true;
+                    }
                 }
-            }
+                false
+            });
         }
 
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
@@ -335,7 +400,11 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
                 epfd.as_raw_fd(),
                 events.as_mut_ptr(),
                 events.len() as i32,
-                SWEEP.as_millis() as i32,
+                if ready.is_empty() {
+                    -1
+                } else {
+                    RETRY.as_millis() as i32
+                },
             )
         };
         if n < 0 {
@@ -348,11 +417,16 @@ fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<Gu
         }
 
         for ev in events.iter().take(n as usize) {
+            if { ev.u64 } == CONTROL {
+                let _ = wake.read();
+                continue;
+            }
             // Copied out first: epoll_event is packed, so its field cannot be
             // borrowed.
             let handle = { ev.u64 } as u32;
-            if !push_event(&vring, &mem, handle) {
-                log::debug!("event pump: no buffer posted for handle {handle}; dropped");
+            if watched.contains_key(&(handle as u64)) {
+                push_event(&vring, &mem, handle);
+                ready.insert(handle as u64);
             }
         }
     }
@@ -375,7 +449,7 @@ struct NvGpuBackend {
     config: VirtioGpuNvConfig,
     /// Started on the first message, because the event queue and guest memory
     /// are not known before then.
-    watches: Option<Sender<Watch>>,
+    watches: Option<EventControl>,
     /// The request and response of the chain being served, kept across chains.
     /// A fresh 64 KiB response zeroed per request cost more than the host's
     /// whole RM call, and only the bytes dispatch writes are sent back.
@@ -450,10 +524,18 @@ impl NvGpuBackend {
                 return;
             };
             let (tx, rx) = channel();
+            let wake = match EventFd::new(EFD_NONBLOCK) {
+                Ok(wake) => Arc::new(wake),
+                Err(e) => {
+                    log::error!("event pump: eventfd: {e}");
+                    return;
+                }
+            };
+            let pump_wake = wake.clone();
             std::thread::Builder::new()
                 .name("nvgpu-events".into())
-                .spawn(move || event_pump(rx, vring, mem))
-                .map(|_| self.watches = Some(tx))
+                .spawn(move || event_pump(rx, pump_wake, vring, mem))
+                .map(|_| self.watches = Some(EventControl { tx: Some(tx), wake }))
                 .unwrap_or_else(|e| log::error!("event pump would not start: {e}"));
         }
         let Some(tx) = self.watches.as_ref() else {
@@ -469,10 +551,10 @@ impl NvGpuBackend {
                 );
                 continue;
             }
-            let _ = tx.send(Watch::Add(handle, unsafe { OwnedFd::from_raw_fd(dup) }));
+            tx.send(Watch::Add(handle, unsafe { OwnedFd::from_raw_fd(dup) }));
         }
         for handle in removed {
-            let _ = tx.send(Watch::Remove(handle));
+            tx.send(Watch::Remove(handle));
         }
     }
 
@@ -615,8 +697,11 @@ impl VhostUserBackendMut for NvGpuBackend {
         // is dispatched, answered with "unknown message", handed back filled,
         // re-posted by the guest, and kicked again -- 7.4 million times in five
         // seconds, measured, the first time two guests ran at once. The pump
-        // thread owns this queue; a kick on it needs no work here.
+        // thread owns this queue; a kick wakes its paced retry if a buffer is available.
         if device_event as usize == EVENT_QUEUE {
+            if let Some(control) = &self.watches {
+                control.notify();
+            }
             return Ok(());
         }
 
@@ -723,4 +808,295 @@ fn main() -> anyhow::Result<()> {
         .teardown();
     log::info!("backend exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::IntoRawFd;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    fn queue() -> (GuestMemoryAtomic<GuestMemoryMmap>, VringRwLock) {
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap(),
+        );
+        let vring = VringRwLock::new(mem.clone(), 8).unwrap();
+        vring.set_queue_info(0x1000, 0x2000, 0x3000).unwrap();
+        vring.set_queue_size(8);
+        vring.set_queue_ready(true);
+        vring.set_queue_event_idx(true);
+        (mem, vring)
+    }
+
+    fn descriptor(mem: &GuestMemoryMmap, index: u16, addr: u64, len: u32, flags: u16, next: u16) {
+        let mut bytes = Vec::new();
+        bytes.extend(addr.to_le_bytes());
+        bytes.extend(len.to_le_bytes());
+        bytes.extend(flags.to_le_bytes());
+        bytes.extend(next.to_le_bytes());
+        mem.write_slice(&bytes, GuestAddress(0x1000 + u64::from(index) * 16))
+            .unwrap();
+    }
+
+    fn post(mem: &GuestMemoryMmap, index: u16, head: u16) {
+        mem.write_obj(
+            head.to_le(),
+            GuestAddress(0x2004 + u64::from(index % 8) * 2),
+        )
+        .unwrap();
+        mem.store((index + 1).to_le(), GuestAddress(0x2002), Ordering::Release)
+            .unwrap();
+    }
+
+    fn used(mem: &GuestMemoryMmap) -> u16 {
+        u16::from_le(mem.load(GuestAddress(0x3002), Ordering::Acquire).unwrap())
+    }
+
+    fn wait_used(mem: &GuestMemoryMmap, count: u16) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while used(mem) != count {
+            assert!(
+                Instant::now() < deadline,
+                "event delivery timed out at {} of {count}",
+                used(mem)
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn event_pump_sleeps_on_quiet_descriptors_and_preserves_readiness_retries() {
+        let (mem, vring) = queue();
+        let wake = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let gpu = EventFd::new(EFD_NONBLOCK).unwrap();
+        let (tx, rx) = channel();
+        let control = EventControl {
+            tx: Some(tx),
+            wake: wake.clone(),
+        };
+        let (started, tid) = channel();
+        let pump_mem = mem.clone();
+        let pump_vring = vring.clone();
+        let pump = std::thread::spawn(move || {
+            started
+                .send(unsafe { libc::syscall(libc::SYS_gettid) })
+                .unwrap();
+            event_pump(rx, wake, pump_vring, pump_mem);
+        });
+        let path = format!("/proc/self/task/{}/status", tid.recv().unwrap());
+        let switches = || -> u64 {
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        control.send(Watch::Add(7, unsafe {
+            OwnedFd::from_raw_fd(gpu.try_clone().unwrap().into_raw_fd())
+        }));
+        std::thread::sleep(Duration::from_millis(30));
+        let before = switches();
+        std::thread::sleep(Duration::from_millis(100));
+        let wakes = switches() - before;
+        assert!(
+            wakes <= 1,
+            "quiet open descriptor woke {wakes} times in 100 ms"
+        );
+        gpu.write(1).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let guard = mem.memory();
+        assert_eq!(used(&guard), 0);
+        assert_eq!(
+            guard
+                .read_obj::<u16>(GuestAddress(0x3000 + 4 + 8 * 8))
+                .unwrap(),
+            0,
+            "empty event queue must request a guest kick"
+        );
+        descriptor(&guard, 0, 0x4000, 16, 2, 0);
+        post(&guard, 0, 0);
+        control.notify();
+        wait_used(&guard, 1);
+        let mut bytes = [0; 16];
+        guard.read_slice(&mut bytes, GuestAddress(0x4000)).unwrap();
+        assert_eq!(bytes.as_slice(), event_ready_bytes(7));
+
+        // A guest poll consumes its flag, so host readiness must be repeated.
+        descriptor(&guard, 1, 0x4100, 16, 2, 0);
+        post(&guard, 1, 1);
+        control.notify();
+        wait_used(&guard, 2);
+        gpu.read().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        // Exercise wraparound and both queue-kick/event arrival orders.
+        for index in 2..66u16 {
+            let head = index % 8;
+            let lock = vring.get_mut();
+            descriptor(&guard, head, 0x4000 + u64::from(head) * 256, 16, 2, 0);
+            if index % 2 == 0 {
+                gpu.write(1).unwrap();
+            }
+            post(&guard, index, head);
+            drop(lock);
+            control.notify();
+            if index % 2 != 0 {
+                gpu.write(1).unwrap();
+            }
+            wait_used(&guard, index + 1);
+            gpu.read().unwrap();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        // Remove an event that could not be delivered, then post a buffer.
+        gpu.write(1).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        control.send(Watch::Remove(7));
+        std::thread::sleep(Duration::from_millis(30));
+        descriptor(&guard, 2, 0x4200, 16, 2, 0);
+        post(&guard, 66, 2);
+        control.notify();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(used(&guard), 66);
+        // Reusing the guest handle must not revive the old fd's pending event.
+        let replacement = EventFd::new(EFD_NONBLOCK).unwrap();
+        control.send(Watch::Add(7, unsafe {
+            OwnedFd::from_raw_fd(replacement.try_clone().unwrap().into_raw_fd())
+        }));
+        control.notify();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(used(&guard), 66);
+        replacement.write(1).unwrap();
+        wait_used(&guard, 67);
+        replacement.read().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        // More ready handles than queue slots must all survive backpressure.
+        let many: Vec<_> = (100..110)
+            .map(|handle| {
+                let fd = EventFd::new(EFD_NONBLOCK).unwrap();
+                fd.write(1).unwrap();
+                control.send(Watch::Add(handle, unsafe {
+                    OwnedFd::from_raw_fd(fd.try_clone().unwrap().into_raw_fd())
+                }));
+                fd
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(30));
+        let mut delivered = HashSet::new();
+        for (start, count) in [(67u16, 8u16), (75, 2)] {
+            let lock = vring.get_mut();
+            for index in start..start + count {
+                let head = index % 8;
+                descriptor(&guard, head, 0x4000 + u64::from(head) * 256, 16, 2, 0);
+                post(&guard, index, head);
+            }
+            drop(lock);
+            control.notify();
+            wait_used(&guard, start + count);
+            for index in start..start + count {
+                let handle = guard
+                    .read_obj::<u32>(GuestAddress(0x4004 + u64::from(index % 8) * 256))
+                    .unwrap();
+                assert!(delivered.insert(handle), "duplicate event for {handle}");
+                many[(handle - 100) as usize].read().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(delivered, (100..110).collect());
+        drop(many);
+        drop(control);
+        pump.join().unwrap();
+    }
+
+    #[test]
+    fn quiet_event_pump_stops_when_control_is_dropped() {
+        let (mem, vring) = queue();
+        let wake = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let (tx, rx) = channel();
+        let control = EventControl {
+            tx: Some(tx),
+            wake: wake.clone(),
+        };
+        let (done, stopped) = channel();
+        let pump = std::thread::spawn(move || {
+            event_pump(rx, wake, vring, mem);
+            done.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        drop(control);
+        stopped
+            .recv_timeout(Duration::from_secs(2))
+            .expect("quiet pump did not stop");
+        pump.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "real NVIDIA quiet-wait benchmark; serialize GPU benchmarks"]
+    fn quiet_nvidia_descriptor_benchmark() {
+        let (mem, vring) = queue();
+        let wake = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let gpu: OwnedFd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/nvidiactl")
+            .unwrap()
+            .into();
+        let mut pfd = libc::pollfd {
+            fd: gpu.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut pfd, 1, 0) },
+            0,
+            "descriptor is not quiet"
+        );
+        let (tx, rx) = channel();
+        let control = EventControl {
+            tx: Some(tx),
+            wake: wake.clone(),
+        };
+        let (started, tid) = channel();
+        let pump = std::thread::spawn(move || {
+            started
+                .send(unsafe { libc::syscall(libc::SYS_gettid) })
+                .unwrap();
+            event_pump(rx, wake, vring, mem);
+        });
+        let dir = format!("/proc/self/task/{}", tid.recv().unwrap());
+        let sample = || -> (u64, u64) {
+            let status = std::fs::read_to_string(format!("{dir}/status")).unwrap();
+            let switches = status
+                .lines()
+                .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let stat = std::fs::read_to_string(format!("{dir}/stat")).unwrap();
+            let fields: Vec<_> = stat[stat.rfind(')').unwrap() + 2..]
+                .split_whitespace()
+                .collect();
+            let ticks = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+            (switches, ticks)
+        };
+        control.send(Watch::Add(7, gpu));
+        std::thread::sleep(Duration::from_millis(100));
+        for run in 0..5 {
+            let before = sample();
+            let start = Instant::now();
+            std::thread::sleep(Duration::from_secs(2));
+            let after = sample();
+            println!(
+                "QUIET_NVIDIA run={run} ms={} voluntary_wakes={} cpu_ticks={}",
+                start.elapsed().as_millis(),
+                after.0 - before.0,
+                after.1 - before.1
+            );
+        }
+        drop(control);
+        pump.join().unwrap();
+    }
 }
