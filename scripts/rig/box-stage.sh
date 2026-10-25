@@ -23,9 +23,15 @@ if pgrep -f "nesbox.*$TAG-" >/dev/null; then
 fi
 
 # C probes are built here, static, so the guest needs no libraries for them.
+# A `.dyn.c` is built dynamic instead, for a probe that has to load a library
+# the guest provides -- the Vulkan loader cannot be linked statically. It
+# relies on the guest's glibc being no older than this host's.
 for c in "$GPU_DIR"/scripts/rig/guest/*.c; do
     [ -f "$c" ] || continue
-    cc -O2 -static -o "${c%.c}" "$c" || { echo "box-stage: $c did not build" >&2; exit 5; }
+    case "$c" in
+    *.dyn.c) cc -O2 -o "${c%.dyn.c}" "$c" -ldl ;;
+    *) cc -O2 -static -o "${c%.c}" "$c" ;;
+    esac || { echo "box-stage: $c did not build" >&2; exit 5; }
 done
 files=("$GPU_DIR/driver/virtio_gpu_nv.ko")
 for f in "$GPU_DIR"/scripts/rig/guest/*; do
