@@ -4272,7 +4272,9 @@ static struct proc_dir_entry *nvgpu_proc_mkdir_parents(char *pathbuf,
       strlcat(built, "/", sizeof(built));
     strlcat(built, p, sizeof(built));
 
-    parent = nvgpu_proc_mkdir_cached(built, NULL);
+    /* Linux owns /proc/driver; proc_mkdir resolves it in full paths. */
+    if (strcmp(built, "driver") != 0)
+      parent = nvgpu_proc_mkdir_cached(built, NULL);
 
     if (next) {
       *next = '/';

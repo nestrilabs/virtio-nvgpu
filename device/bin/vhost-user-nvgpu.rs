@@ -226,11 +226,13 @@ impl Drop for EventControl {
 }
 
 /// One `EventReady` message: a bare header naming the descriptor.
-fn event_ready_bytes(handle: u32) -> Vec<u8> {
+fn event_ready_bytes(handle: u32) -> [u8; size_of::<MsgHeader>()] {
     let hdr = MsgHeader::ok(MsgType::EventReady, handle);
     // The wire form is the struct's bytes, which is what the driver reads.
     let p = &hdr as *const MsgHeader as *const u8;
-    unsafe { std::slice::from_raw_parts(p, size_of::<MsgHeader>()) }.to_vec()
+    unsafe { std::slice::from_raw_parts(p, size_of::<MsgHeader>()) }
+        .try_into()
+        .unwrap()
 }
 
 /// Put one message on the event queue, into a buffer the guest posted there.
@@ -575,15 +577,18 @@ impl NvGpuBackend {
 
             let head = chain.head_index();
             let mut resp_desc = None;
-            self.req.clear();
+            let mut req_len = 0;
 
             for desc in chain.clone() {
                 if desc.is_write_only() {
                     resp_desc = Some(desc);
                 } else {
-                    let at = self.req.len();
-                    self.req.resize(at + desc.len() as usize, 0);
-                    mem.read_slice(&mut self.req[at..], desc.addr())
+                    let at = req_len;
+                    req_len += desc.len() as usize;
+                    if req_len > self.req.len() {
+                        self.req.resize(req_len, 0);
+                    }
+                    mem.read_slice(&mut self.req[at..req_len], desc.addr())
                         .map_err(|e| {
                             std::io::Error::other(format!("read request descriptor: {e}"))
                         })?;
@@ -598,7 +603,7 @@ impl NvGpuBackend {
                         .nvidia
                         .lock()
                         .expect("backend mutex")
-                        .dispatch(&self.req, resp);
+                        .dispatch(&self.req[..req_len], resp);
                     if n > 0 {
                         mem.write_slice(&resp[..n], d.addr()).map_err(|e| {
                             std::io::Error::other(format!("write response descriptor: {e}"))
@@ -845,8 +850,12 @@ mod tests {
             GuestAddress(0x2004 + u64::from(index % 8) * 2),
         )
         .unwrap();
-        mem.store((index + 1).to_le(), GuestAddress(0x2002), Ordering::Release)
-            .unwrap();
+        mem.store(
+            index.wrapping_add(1).to_le(),
+            GuestAddress(0x2002),
+            Ordering::Release,
+        )
+        .unwrap();
     }
 
     fn used(mem: &GuestMemoryMmap) -> u16 {
@@ -862,6 +871,22 @@ mod tests {
                 used(mem)
             );
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn event_ready_header_matches_wire_format() {
+        for handle in [0u32, 7, u32::MAX] {
+            let bytes = event_ready_bytes(handle);
+            assert_eq!(bytes.len(), size_of::<MsgHeader>());
+            let hdr = MsgHeader::ok(MsgType::EventReady, handle);
+            let expected = unsafe {
+                std::slice::from_raw_parts(
+                    (&hdr as *const MsgHeader).cast::<u8>(),
+                    size_of::<MsgHeader>(),
+                )
+            };
+            assert_eq!(&bytes, expected);
         }
     }
 
@@ -1098,5 +1123,98 @@ mod tests {
         }
         drop(control);
         pump.join().unwrap();
+    }
+    
+    #[test]
+    fn cached_requests_do_not_include_stale_bytes_and_join_readable_descriptors() {
+        let (mem, vring) = queue();
+        let mut backend = NvGpuBackend {
+            nvidia: Arc::new(Mutex::new(NvidiaBackend::with_default_zones())),
+            mem: Some(mem.clone()),
+            event_idx: true,
+            config: VirtioGpuNvConfig::default(),
+            watches: None,
+            req: Vec::new(),
+            resp: vec![0; RESP_MAX],
+        };
+        let guard = mem.memory();
+        // A malformed message, then a shorter header split across descriptors.
+        // The latter's request length must exclude the first request's tail.
+        for (index, len) in [4096usize, 16, 32, 0, 8192, 16]
+            .into_iter()
+            .cycle()
+            .take(10000)
+            .enumerate()
+        {
+            let mut request = vec![0xa5; len];
+            if len >= 16 {
+                let hdr = MsgHeader::ok(MsgType::Ioctl, index as u32);
+                request[..16].copy_from_slice(unsafe {
+                    std::slice::from_raw_parts((&hdr as *const MsgHeader).cast::<u8>(), 16)
+                });
+            }
+            guard.write_slice(&request, GuestAddress(0x4000)).unwrap();
+            let split = len / 2;
+            descriptor(&guard, 0, 0x4000, split as u32, 1, 1);
+            descriptor(&guard, 1, 0x4000 + split as u64, (len - split) as u32, 1, 2);
+            descriptor(&guard, 2, 0x10000, 64, 2, 0);
+            post(&guard, index as u16, 0);
+            let mut expected = [0; 64];
+            let n = backend
+                .nvidia
+                .lock()
+                .unwrap()
+                .dispatch(&request, &mut expected);
+            assert!(backend.process(&vring, &guard).unwrap());
+            assert_eq!(used(&guard), index as u16 + 1);
+            assert_eq!(
+                guard
+                    .read_obj::<u32>(GuestAddress(0x3008 + (index % 8) as u64 * 8))
+                    .unwrap(),
+                n as u32
+            );
+            let mut actual = vec![0; n];
+            guard
+                .read_slice(&mut actual, GuestAddress(0x10000))
+                .unwrap();
+            assert_eq!(actual, expected[..n]);
+        }
+    }
+
+    #[test]
+    #[ignore = "request-copy benchmark; run in release mode on a fixed CPU"]
+    fn request_queue_benchmark() {
+        for len in [32, 4096, 65536] {
+            let (mem, vring) = queue();
+            let mut backend = NvGpuBackend {
+                nvidia: Arc::new(Mutex::new(NvidiaBackend::with_default_zones())),
+                mem: Some(mem.clone()),
+                event_idx: true,
+                config: VirtioGpuNvConfig::default(),
+                watches: None,
+                req: Vec::new(),
+                resp: vec![0; RESP_MAX],
+            };
+            let guard = mem.memory();
+            let mut request = vec![0; len];
+            request[..16].copy_from_slice(&event_ready_bytes(0));
+            guard.write_slice(&request, GuestAddress(0x4000)).unwrap();
+            descriptor(&guard, 0, 0x4000, len as u32, 1, 1);
+            descriptor(&guard, 1, 0x18000, 16, 2, 0);
+            for index in 0..100u16 {
+                post(&guard, index as u16, 0);
+                assert!(backend.process(&vring, &guard).unwrap());
+            }
+            let start = Instant::now();
+            for index in 100..1000100u32 {
+                post(&guard, index as u16, 0);
+                assert!(backend.process(&vring, &guard).unwrap());
+            }
+            assert_eq!(used(&guard), 1000100u32 as u16);
+            println!(
+                "REQUEST_QUEUE bytes={len} ns_per_call={:.1}",
+                start.elapsed().as_nanos() as f64 / 1000000.0
+            );
+        }
     }
 }

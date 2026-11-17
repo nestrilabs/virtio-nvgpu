@@ -196,6 +196,15 @@ impl NvidiaBackend {
             }
         };
 
+        // Refuse before arming a host mapping that the guest cannot use.
+        let Some(window) = self.window.as_ref() else {
+            log::warn!(
+                "NV_ESC_RM_MAP_MEMORY: no shared window, so device memory cannot be \
+                 addressed by the guest"
+            );
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTSUP);
+        };
+
         // A host fd is single-use for mapping. The host will refuse this with
         // NV_ERR_STATE_IN_USE; say so here, because that status on its own
         // sends you looking at the unmap path, which is not the problem.
@@ -286,15 +295,11 @@ impl NvidiaBackend {
         // the mapping exists on the host and is unreachable from the guest, so
         // the honest answer is to fail the call rather than return an address
         // that names nothing.
-        let Some(window) = self.window.as_ref() else {
-            log::warn!(
-                "NV_ESC_RM_MAP_MEMORY: no shared window, so device memory cannot be \
-                 addressed by the guest"
-            );
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTSUP);
-        };
         if let Err(e) = window.place(region.offset, length, host_map_fd, 0, true) {
             log::error!("NV_ESC_RM_MAP_MEMORY: placing in the window failed: {}", e);
+            if let Err(e) = self.shm.free(&region) {
+                log::warn!("NV_ESC_RM_MAP_MEMORY: releasing failed placement: {e}");
+            }
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
 

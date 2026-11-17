@@ -155,6 +155,11 @@ impl NvidiaBackend {
             }
         }
 
+        let Some(window) = self.window.as_ref() else {
+            log::warn!("mmap on handle {handle}: no shared window to place it in");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOTSUP);
+        };
+
         let length = size.max(4096);
         let region = match self.shm.alloc(length, pgprot) {
             Ok(r) => r,
@@ -164,16 +169,14 @@ impl NvidiaBackend {
             }
         };
 
-        let Some(window) = self.window.as_ref() else {
-            log::warn!("mmap on handle {handle}: no shared window to place it in");
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOTSUP);
-        };
         if let Err(e) = window.place(region.offset, length, host_fd, fd_offset, true) {
             log::warn!(
                 "mmap on handle {handle}: nothing armed on this file, or it could \
                  not be placed: {e}"
             );
-            self.shm.free(&region);
+            if let Err(e) = self.shm.free(&region) {
+                log::warn!("mmap on handle {handle}: releasing failed placement: {e}");
+            }
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
         }
 
